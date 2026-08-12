@@ -1,0 +1,111 @@
+# plugin CMake file to be included in main project CMakelists
+
+# --- Cabinet Bridge plugin ---
+# Forwards live PinMAME switch/lamp/solenoid/GI/mech state to the pinball_cab dashboard's
+# cabinet event bus over a raw-socket HTTP POST to localhost -- see plugins/cabinetbridge/
+# CabinetBridgePlugin.cpp for the full design writeup. No third-party dependency (deliberately
+# not linking libcurl, since the destination is always 127.0.0.1) -- this file is modeled on
+# CMakeLists_plugin_HelloWorld.txt, the simplest existing plugin with no extra native lib.
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_C_STANDARD 99)
+
+set(RUNTIME_LIBS_DIR "${CMAKE_SOURCE_DIR}/third-party/runtime-libs/${PLATFORM}-${ARCH}")
+
+set(CABINETBRIDGE_PLUGIN_SOURCES
+   plugins/cabinetbridge/CabinetBridgePlugin.cpp
+   plugins/plugins/B2SPluginEventStream.h
+   plugins/plugins/B2SPluginEventStream.cpp
+)
+
+if(BUILD_SHARED)
+   add_library(CabinetBridgePlugin MODULE ${CABINETBRIDGE_PLUGIN_SOURCES})
+
+   target_include_directories(CabinetBridgePlugin PUBLIC
+      ${CMAKE_SOURCE_DIR}/third-party/include
+      plugins
+      plugins/cabinetbridge
+   )
+
+   if(PLATFORM STREQUAL "windows" OR PLATFORM STREQUAL "windows-mingw")
+      target_link_libraries(CabinetBridgePlugin PUBLIC ws2_32)
+      if(MSVC)
+         set_target_properties(CabinetBridgePlugin PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+         )
+         set(OPT_COMMON
+            /Ob2
+            /O2
+            /Oi
+            /fp:fast
+            /fp:except-
+            /Ot
+            /GF
+            /GS-
+            /Gy
+            /GR
+            /Oy
+            /GT
+            /GL
+            /w44005
+            /Zc:__cplusplus
+            /std:c++20
+            $<$<NOT:$<STREQUAL:${ARCH},x64>>:/arch:SSE2>
+         )
+         target_compile_options(CabinetBridgePlugin PUBLIC
+            $<$<CONFIG:Release>:$<$<COMPILE_LANGUAGE:CXX>:${OPT_COMMON}>>
+            $<$<CONFIG:Release>:$<$<COMPILE_LANGUAGE:C>:${OPT_COMMON}>>
+         )
+         target_link_options(CabinetBridgePlugin PUBLIC
+            $<$<CONFIG:Release>:/INCREMENTAL:NO>
+            $<$<CONFIG:Release>:/OPT:REF>
+            $<$<CONFIG:Release>:/OPT:ICF>
+            $<$<CONFIG:Release>:/LTCG>
+         )
+      endif()
+      set_target_properties(CabinetBridgePlugin PROPERTIES
+         PREFIX ""
+         OUTPUT_NAME "$<IF:$<STREQUAL:${ARCH},x64>,plugin-cabinetbridge64,plugin-cabinetbridge>"
+      )
+   else()
+      set_target_properties(CabinetBridgePlugin PROPERTIES
+         PREFIX ""
+         OUTPUT_NAME "plugin-cabinetbridge"
+      )
+      if(PLATFORM STREQUAL "macos")
+         set_target_properties(CabinetBridgePlugin PROPERTIES
+            SUFFIX ".dylib"
+         )
+      endif()
+   endif()
+
+   add_custom_command(TARGET CabinetBridgePlugin POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_SOURCE_DIR}/plugins/cabinetbridge/plugin.cfg" "${PLUGINS_DIR}/cabinetbridge/plugin.cfg"
+      COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:CabinetBridgePlugin>" "${PLUGINS_DIR}/cabinetbridge"
+      COMMAND "${CMAKE_COMMAND}" -E rm "$<TARGET_FILE:CabinetBridgePlugin>"
+   )
+
+   if(POST_BUILD_COPY_EXT_LIBS AND PLATFORM STREQUAL "windows-mingw")
+      add_custom_command(TARGET CabinetBridgePlugin POST_BUILD
+         COMMAND "${CMAKE_COMMAND}" -E copy "${RUNTIME_LIBS_DIR}/libgcc_s_seh-1.dll" "${PLUGINS_DIR}/cabinetbridge/libgcc_s_seh-1.dll"
+         COMMAND "${CMAKE_COMMAND}" -E copy "${RUNTIME_LIBS_DIR}/libstdc++-6.dll" "${PLUGINS_DIR}/cabinetbridge/libstdc++-6.dll"
+      )
+   endif()
+endif()
+
+if(BUILD_STATIC)
+   add_compile_options(-fPIC)
+
+   add_library(CabinetBridgePlugin STATIC ${CABINETBRIDGE_PLUGIN_SOURCES})
+
+   target_include_directories(CabinetBridgePlugin PUBLIC
+      ${CMAKE_SOURCE_DIR}/third-party/include
+      plugins
+      plugins/cabinetbridge
+   )
+
+   set_target_properties(CabinetBridgePlugin PROPERTIES
+      PREFIX ""
+      OUTPUT_NAME "plugin-cabinetbridge"
+   )
+endif()

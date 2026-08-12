@@ -888,6 +888,7 @@ elseif(PLATFORM STREQUAL "ios" OR PLATFORM STREQUAL "ios-simulator" OR PLATFORM 
       AlphaDMDPlugin
       B2SPlugin
       B2SLegacyPlugin
+      CabinetBridgePlugin
       DMDUtilPlugin
       DOFPlugin
       FlexDMDPlugin
