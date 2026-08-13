@@ -45,11 +45,16 @@ static std::unique_ptr<B2SPluginEventStream> b2sPluginEventStream;
 
 // Maps B2SPluginEventStream's single-letter event type (see B2SPluginEventStream.h) to what
 // the dashboard's event bus already knows how to color/display (.tag.switch/.lamp/.gi/.mech/
-// .solenoid in cabinet-dashboard/public/index.html + eventbus.html). D (DMD/segment display
-// frame ids) and the B2S-controller-specific E/B/C are deliberately NOT forwarded: DMD frame
-// updates fire far too often (every rendered frame) to be useful as discrete log lines, and
-// E/B/C are backglass-specific, not core PinMAME game state -- out of scope for "what did the
-// table just do".
+// .solenoid/.score in cabinet-dashboard/public/index.html + eventbus.html). D (DMD/segment
+// display frame ids) and the B2S-controller-specific E/B are deliberately NOT forwarded: DMD
+// frame updates fire far too often (every rendered frame) to be useful as discrete log lines,
+// E is a generic backglass input (not game state), and B is the PER-DIGIT score-reel update
+// that drives C -- same "too noisy to be a useful discrete line" problem as D, one event per
+// digit per change instead of one per actual score change.
+// C (the actual running score, event->index = player number, event->value = score) IS
+// forwarded as "score" -- broadcast by the table's own .directb2s B2S controller whenever a
+// player's score changes (OnB2SStateChange in B2SPluginEventStream.cpp), so this only fires
+// for tables with a real backglass loaded, same as the on-screen score reels it drives.
 static const char* TypeName(char c)
 {
    switch (c) {
@@ -58,6 +63,7 @@ static const char* TypeName(char c)
       case 'L': return "lamp";
       case 'S': return "solenoid";
       case 'G': return "gi";
+      case 'C': return "score";
       default: return nullptr; // not forwarded
    }
 }
@@ -141,13 +147,22 @@ private:
          if (!first)
             json += ",";
          first = false;
-         char tag[8];
-         snprintf(tag, sizeof(tag), "%c%d", ev.type, ev.id);
+         // Score events get a readable "P<n>" tag (event->index is the player number) and a
+         // "score=" detail label instead of the generic "<type><id>"/"value=" every other
+         // forwarded type uses -- "C0 value=14500" reads a lot less clearly on the event bus
+         // than "P1 score=14500" for the one type that's actually meant to be read as a number
+         // going up, not just a discrete state change.
+         char tag[16];
+         if (ev.type == 'C')
+            snprintf(tag, sizeof(tag), "P%d", ev.id + 1);
+         else
+            snprintf(tag, sizeof(tag), "%c%d", ev.type, ev.id);
          json += "{\"type\":\"";
          json += typeName;
          json += "\",\"tag\":\"";
          AppendEscaped(json, tag);
-         json += "\",\"label\":\"\",\"detail\":\"value=";
+         json += "\",\"label\":\"\",\"detail\":\"";
+         json += (ev.type == 'C') ? "score=" : "value=";
          json += std::to_string(ev.value);
          json += "\"}";
       }
