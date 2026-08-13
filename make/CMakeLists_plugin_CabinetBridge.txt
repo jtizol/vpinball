@@ -1,11 +1,14 @@
 # plugin CMake file to be included in main project CMakelists
 
 # --- Cabinet Bridge plugin ---
-# Forwards live PinMAME switch/lamp/solenoid/GI/mech state to the pinball_cab dashboard's
-# cabinet event bus over a raw-socket HTTP POST to localhost -- see plugins/cabinetbridge/
-# CabinetBridgePlugin.cpp for the full design writeup. No third-party dependency (deliberately
-# not linking libcurl, since the destination is always 127.0.0.1) -- this file is modeled on
-# CMakeLists_plugin_HelloWorld.txt, the simplest existing plugin with no extra native lib.
+# Forwards live PinMAME switch/lamp/solenoid/GI/mech/score state to the pinball_cab
+# dashboard's cabinet event bus over a raw-socket HTTP POST to localhost -- see
+# plugins/cabinetbridge/CabinetBridgePlugin.cpp for the full design writeup. No libcurl
+# dependency (deliberately, since the destination is always 127.0.0.1) -- this file started
+# out modeled on CMakeLists_plugin_HelloWorld.txt, the simplest existing plugin with no extra
+# native lib. It DOES now link against `pinmame` directly (same as CMakeLists_plugin_PinMAME.txt),
+# for live score forwarding via PinmameGetNVRAM/PinmameGetMaxNVRAM -- there's no MsgPluginAPI
+# message for NVRAM access, libpinmame's C API is the only exposed surface for it.
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_C_STANDARD 99)
@@ -28,7 +31,7 @@ if(BUILD_SHARED)
    )
 
    if(PLATFORM STREQUAL "windows" OR PLATFORM STREQUAL "windows-mingw")
-      target_link_libraries(CabinetBridgePlugin PUBLIC ws2_32)
+      target_link_libraries(CabinetBridgePlugin PUBLIC ws2_32 $<IF:$<STREQUAL:${ARCH},x64>,pinmame64,pinmame>)
       if(MSVC)
          set_target_properties(CabinetBridgePlugin PROPERTIES
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
@@ -68,6 +71,10 @@ if(BUILD_SHARED)
          OUTPUT_NAME "$<IF:$<STREQUAL:${ARCH},x64>,plugin-cabinetbridge64,plugin-cabinetbridge>"
       )
    else()
+      # RUNTIME_LIBS_DIR (not BUILD_LIBS_DIR) is where macOS's libpinmame.dylib actually lives --
+      # matches CMakeLists_plugin_PinMAME.txt's own macOS-specific target_link_directories.
+      target_link_directories(CabinetBridgePlugin PUBLIC ${RUNTIME_LIBS_DIR})
+      target_link_libraries(CabinetBridgePlugin PUBLIC pinmame)
       set_target_properties(CabinetBridgePlugin PROPERTIES
          PREFIX ""
          OUTPUT_NAME "plugin-cabinetbridge"

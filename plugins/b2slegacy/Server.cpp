@@ -1651,8 +1651,21 @@ void Server::MyB2SSetScore(int digit, int score)
 
 void Server::MyB2SSetScorePlayer(int playerno, int score)
 {
-   if (m_pB2SData->IsBackglassRunning()) {
-      if (playerno > 0) {
+   if (playerno > 0) {
+      // Broadcast the plugin event UNCONDITIONALLY (not gated on IsBackglassRunning below,
+      // which only guards the visual reel/LED update) -- mirrors MyB2SSetData's existing
+      // 'E' broadcast just above in this file, and matches the sibling plugins/b2s/B2SServer.cpp
+      // (the newer B2S plugin, currently disabled in our config -- see CLAUDE.md "Live gameplay
+      // event capture") which already does exactly this for B2SSetScorePlayer. Real bug this
+      // fixes: this function -- the single choke point every B2SSetScorePlayer/1..6 table-script
+      // call goes through -- never broadcast ANY plugin event, so CabinetBridge's new "score"
+      // forwarding (see CabinetBridgePlugin.cpp) silently never fired despite real switch/lamp
+      // events flowing fine; confirmed live, a full BTTF play session produced zero 'C' events.
+      struct B2SPluginEvent { uint8_t type; int32_t index; int32_t value; };
+      B2SPluginEvent event { 'C', playerno, score };
+      m_msgApi->BroadcastMsg(m_endpointId, m_onStateChangeEventId, &event);
+
+      if (m_pB2SData->IsBackglassRunning()) {
          // Set score to player class
          if (m_pB2SData->GetPlayers()->contains(playerno))
             (*m_pB2SData->GetPlayers())[playerno]->SetScore(m_pB2SData, score);
