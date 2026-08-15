@@ -333,6 +333,16 @@ typedef struct GetSegSrcMsg
 // Broadcasted when an audio stream is updated with new samples
 #define CTLPI_AUDIO_ON_UPDATE_MSG  "AudioUpdate"
 
+// Broadcasted to ask the host to change an audio source's mixer gain LIVE, message data is a
+// pointer to a SetAudioSrcVolumeMsg. Added for pinball_cab: the mixer gain was previously
+// reachable only from VPX's own in-game audio page, so an external controller (a cabinet
+// dashboard, a physical knob) could only change it by writing the ini and relaunching the
+// table. This is the inbound counterpart to CTLPI_AUDIO_GET_SRC_MSG.
+//
+// The host applies it to the live mixer only and does NOT persist it -- whoever sends this owns
+// the persisted value, so the host can never fight an external controller over the ini.
+#define CTLPI_AUDIO_SET_SRC_VOL_MSG "SetAudioSrcVolume"
+
 #define CTLPI_AUDIO_TARGET_BACKGLASS         0
 
 #define CTLPI_AUDIO_FORMAT_CHANNEL_MONO      0
@@ -364,6 +374,12 @@ typedef struct GetAudioSrcMsg
 // - Enqueueing in an existing stream: bufferSize & buffer and volume must be defined (other fields are ignored)
 // - Destroying an existing stream: buffer must be null (other fields are ignored)
 // For all these use cases, source and stream must always be defined and valid.
+typedef struct SetAudioSrcVolumeMsg
+{
+   CtlResId sourceId;            // Audio source whose mixer gain to change
+   float volume;                 // New gain, same 0.0-2.0 scale as the AudioSource.<id>.Gain setting
+} SetAudioSrcVolumeMsg;
+
 typedef struct AudioUpdateMsg
 {
    CtlResId sourceId;            // Unique Id of the audio source

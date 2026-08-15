@@ -245,8 +245,12 @@ private:
 
    static void OnAudioUpdated(const unsigned int msgId, void *userData, void *msgData);
    static void OnAudioSrcChanged(const unsigned int msgId, void *userData, void *msgData);
+   // Lets an external controller (see CTLPI_AUDIO_SET_SRC_VOL_MSG) move a lane's mixer gain
+   // while a table is running. Applies to the live mixer only; never persists.
+   static void OnSetAudioSrcVolume(const unsigned int msgId, void *userData, void *msgData);
    unsigned int m_onAudioUpdatedMsgId;
    unsigned int m_onAudioSrcChangedMsgId;
+   unsigned int m_setAudioSrcVolMsgId = 0;
    unsigned int m_getAudioSrcMsgId;
    mutable std::mutex m_audioSourceMutex;
    struct AudioLane

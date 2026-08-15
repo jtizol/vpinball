@@ -17,6 +17,9 @@
 #include <string>
 #include <fstream>
 #include <filesystem>
+#include <map>
+#include <cmath>
+#include <algorithm>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -175,14 +178,69 @@ private:
       }
       json += "]";
       if (!first) // at least one event actually got written
-         PostJson(json);
+         PostJson("/api/emit", json);
    }
 
    // A minimal, blocking HTTP/1.1 POST over a raw TCP socket to 127.0.0.1:7333 -- no TLS, no
    // libcurl dependency (nothing else in this plugin tree links it), since the destination is
    // always localhost. Short connect/read timeouts + silent drop-on-failure so a dashboard
    // that isn't running (or briefly restarting) can never stall this thread.
-   static void PostJson(const std::string& json)
+public:
+   // Public + path-parameterised because the audio meter below posts to a DIFFERENT endpoint
+   // (/api/audio-levels, not the event bus) over the same tiny localhost socket helper.
+   // Minimal HTTP/1.1 GET returning just the body, same raw-socket approach and 200ms timeouts
+   // as PostJson below -- the gain poller needs to READ from the dashboard, which every other
+   // path in this plugin never had to do.
+   static std::string GetBody(const char* path)
+   {
+      std::string resp;
+#ifdef _WIN32
+      SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+      if (sock == INVALID_SOCKET) return resp;
+      DWORD toMs = 200;
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&toMs, sizeof(toMs));
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&toMs, sizeof(toMs));
+#else
+      int sock = socket(AF_INET, SOCK_STREAM, 0);
+      if (sock < 0) return resp;
+      struct timeval to { 0, 200000 };
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+#endif
+      sockaddr_in addr {};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(7333);
+      inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+      if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
+         const std::string req = std::string("GET ") + path + " HTTP/1.1\r\n"
+            "Host: localhost\r\nConnection: close\r\n\r\n";
+         send(sock, req.c_str(), (int)req.size(), 0);
+         char buf[2048];
+         int n;
+         while ((n = (int)recv(sock, buf, sizeof(buf), 0)) > 0)
+            resp.append(buf, n);
+      }
+#ifdef _WIN32
+      closesocket(sock);
+#else
+      close(sock);
+#endif
+      const size_t sep = resp.find("\r\n\r\n");
+      if (sep == std::string::npos)
+         return std::string();
+      const std::string body = resp.substr(sep + 4);
+      // Node sends these small responses CHUNKED, so the raw body is "3b\r\n{...}\r\n0\r\n\r\n"
+      // and feeding it straight to a JSON parser throws on the chunk-size line. Rather than
+      // implement de-chunking for one tiny endpoint, take the outermost JSON object. Verified
+      // against the real server: without this the poller silently caught, continued, and the
+      // whole live-control path did nothing while looking perfectly healthy.
+      const size_t open = body.find('{'), close = body.rfind('}');
+      if (open == std::string::npos || close == std::string::npos || close < open)
+         return std::string();
+      return body.substr(open, close - open + 1);
+   }
+
+   static void PostJson(const char* path, const std::string& json)
    {
 #ifdef _WIN32
       static bool wsaInit = false;
@@ -212,7 +270,7 @@ private:
       inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
       if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
-         const std::string req = "POST /api/emit HTTP/1.1\r\n"
+         const std::string req = std::string("POST ") + path + " HTTP/1.1\r\n"
             "Host: localhost\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: " + std::to_string(json.size()) + "\r\n"
@@ -235,6 +293,7 @@ private:
 #endif
    }
 
+private:
    std::vector<QueuedEvent> m_queue;
    std::mutex m_mutex;
    std::condition_variable m_cv;
@@ -243,6 +302,283 @@ private:
 };
 
 static std::unique_ptr<HttpSender> sender;
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// Live audio lane metering.
+//
+// PinMAME, PUP and AltSound each BROADCAST CTLPI_AUDIO_ON_UPDATE_MSG carrying their raw sample
+// buffer; player.cpp subscribes to that same broadcast to actually play it. We subscribe purely
+// to MEASURE it. Nothing here touches the engine core and nothing here affects what is heard --
+// the meter is a passive tap on a message that was already being sent.
+//
+// SCOPE: this is PLUGIN audio only, i.e. the backglass bus. The table's own SFX and music are
+// played through VPX's internal SoundPlayer/MusicPlayer and never appear as an AudioUpdate, so
+// they have no live meter. See docs/decisions/audio-streams.md.
+//
+// Levels are PRE-lane-gain: we scale by msg.volume (the stream's own volume, which is where
+// per-clip PuP volumes above 100% show up) but NOT by AudioSource.<id>.Gain or MusicVolume,
+// because those live host-side. The dashboard applies them, so the panel can show pre- and
+// post-fader from one number without this plugin having to know the mixer state.
+class AudioMeter
+{
+public:
+   AudioMeter() { m_thread = std::thread(&AudioMeter::Run, this); }
+   ~AudioMeter()
+   {
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         m_stopRequested = true;
+      }
+      m_cv.notify_one();
+      if (m_thread.joinable())
+         m_thread.join();
+   }
+   AudioMeter(const AudioMeter&) = delete;
+   AudioMeter& operator=(const AudioMeter&) = delete;
+
+   // Called on the plugin API thread, once per enqueued buffer. Kept to a tight arithmetic loop
+   // plus one short lock: this runs in the audio path's critical section and must never block.
+   void Accumulate(const AudioUpdateMsg& msg)
+   {
+      if (msg.buffer == nullptr || msg.bufferSize == 0)
+         return;
+      double sumSq = 0.0, peak = 0.0;
+      size_t n = 0;
+      // bufferSize is BYTES -- it is handed straight to SDL_PutAudioStreamData downstream.
+      if (msg.sampleFormat == CTLPI_AUDIO_FORMAT_SAMPLE_INT16) {
+         n = msg.bufferSize / sizeof(int16_t);
+         const int16_t* p = reinterpret_cast<const int16_t*>(msg.buffer);
+         for (size_t i = 0; i < n; ++i) {
+            const double v = p[i] / 32768.0;
+            sumSq += v * v;
+            if (std::abs(v) > peak) peak = std::abs(v);
+         }
+      }
+      else if (msg.sampleFormat == CTLPI_AUDIO_FORMAT_SAMPLE_FLOAT) {
+         n = msg.bufferSize / sizeof(float);
+         const float* p = reinterpret_cast<const float*>(msg.buffer);
+         for (size_t i = 0; i < n; ++i) {
+            const double v = p[i];
+            sumSq += v * v;
+            if (std::abs(v) > peak) peak = std::abs(v);
+         }
+      }
+      else
+         return; // unknown sample format -- measuring it would be worse than not measuring it
+      if (n == 0)
+         return;
+      const double vol = msg.volume;
+      std::lock_guard<std::mutex> lock(m_mutex);
+      Lane& lane = m_lanes[msg.sourceId.id];
+      lane.sumSq += sumSq * vol * vol;
+      lane.samples += n;
+      lane.peak = std::max(lane.peak, peak * vol);
+   }
+
+   // Called on the plugin API thread when the source list changes (and once at load), mirroring
+   // player.cpp's own OnAudioSrcChanged. Resolving names here rather than in the flush thread
+   // keeps every msgApi call on the API thread, which the host asserts on.
+   void RefreshNames()
+   {
+      std::vector<AudioSrcId> srcs;
+      GetCtrlItems<AudioSrcId>(msgApi, endpointId, m_getSrcId, srcs);
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_names.clear();
+      for (const auto& s : srcs)
+         m_names[s.id.id] = (s.name && *s.name) ? s.name : "audio";
+   }
+
+   void SetGetSrcId(unsigned int id) { m_getSrcId = id; }
+
+private:
+   struct Lane { double sumSq = 0.0; double peak = 0.0; uint64_t samples = 0; };
+
+   void Run()
+   {
+      // ~20Hz. Fast enough that a callout visibly spikes its lane, slow enough that an idle
+      // cabinet isn't posting constantly -- and a tick with no audio at all posts nothing.
+      while (true) {
+         std::map<uint64_t, Lane> lanes;
+         std::map<uint64_t, std::string> names;
+         {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, std::chrono::milliseconds(50), [this] { return m_stopRequested; });
+            if (m_stopRequested)
+               return;
+            lanes.swap(m_lanes);
+            names = m_names;
+         }
+         if (lanes.empty())
+            continue; // silence: say nothing rather than post a wall of zeroes
+         std::string json = "{\"lanes\":[";
+         bool first = true;
+         for (const auto& [id, lane] : lanes) {
+            if (lane.samples == 0)
+               continue;
+            const double rms = std::sqrt(lane.sumSq / static_cast<double>(lane.samples));
+            if (!first) json += ",";
+            first = false;
+            const auto it = names.find(id);
+            char buf[192];
+            snprintf(buf, sizeof(buf), "{\"id\":%llu,\"name\":\"%s\",\"rms\":%.5f,\"peak\":%.5f}",
+                     static_cast<unsigned long long>(id),
+                     it == names.end() ? "audio" : it->second.c_str(), rms, std::min(lane.peak, 4.0));
+            json += buf;
+         }
+         json += "]}";
+         if (!first)
+            HttpSender::PostJson("/api/audio-levels", json);
+      }
+   }
+
+   std::map<uint64_t, Lane> m_lanes;
+   std::map<uint64_t, std::string> m_names;
+   unsigned int m_getSrcId = 0;
+   std::mutex m_mutex;
+   std::condition_variable m_cv;
+   bool m_stopRequested = false;
+   std::thread m_thread;
+};
+
+static std::unique_ptr<AudioMeter> audioMeter;
+static std::mutex gainPollerMutex;
+static std::unique_ptr<std::map<std::string, float>> gainPollerPending;
+static unsigned int onAudioUpdateId = 0;
+static unsigned int onAudioSrcChangedId = 0;
+static unsigned int getAudioSrcId = 0;
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// Live mixer control -- the inbound direction.
+//
+// Everything else in this plugin pushes data OUT. This pulls: it polls the dashboard for the
+// gain each audio lane should have and applies it to the RUNNING table, so moving a fader
+// changes the sound immediately instead of at the next launch. VPX's mixer gain was previously
+// reachable only from its own in-game audio page.
+//
+// THREADING. MsgPlugin.h is explicit: "The plugin API is not thread safe", and RunOnMainThread
+// is the ONLY method callable from any thread. So the poll (a blocking socket read) happens on
+// our own thread, and the actual BroadcastMsg is marshalled onto the main thread. Calling
+// BroadcastMsg straight from the poller would be a race against the host's own audio bookkeeping.
+//
+// Declarative, not command-based: we poll the DESIRED state and push whatever differs from what
+// we last applied. A dropped poll self-heals on the next tick, and nothing has to queue,
+// sequence or retry individual commands.
+class GainPoller
+{
+public:
+   GainPoller() { m_thread = std::thread(&GainPoller::Run, this); }
+   ~GainPoller()
+   {
+      {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         m_stopRequested = true;
+      }
+      m_cv.notify_one();
+      if (m_thread.joinable())
+         m_thread.join();
+   }
+   GainPoller(const GainPoller&) = delete;
+   GainPoller& operator=(const GainPoller&) = delete;
+
+   // Runs on the MAIN thread, via RunOnMainThread.
+   static void ApplyPending(void* /*userData*/)
+   {
+      if (!msgApi || !gainPollerPending)
+         return;
+      std::map<std::string, float> pending;
+      {
+         std::lock_guard<std::mutex> lock(gainPollerMutex);
+         pending.swap(*gainPollerPending);
+      }
+      if (pending.empty())
+         return;
+      // Resolve names to source ids here rather than in the poller: GetCtrlItems talks to the
+      // msg API, which is main-thread-only like everything else.
+      std::vector<AudioSrcId> srcs;
+      GetCtrlItems<AudioSrcId>(msgApi, endpointId, getAudioSrcId, srcs);
+
+      const unsigned int setVolId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_SRC_VOL_MSG);
+      for (const auto& src : srcs) {
+         const std::string name = (src.name && *src.name) ? src.name : "";
+         const auto it = pending.find(name);
+         if (it == pending.end())
+            continue;
+         SetAudioSrcVolumeMsg msg { src.id, it->second };
+         msgApi->BroadcastMsg(endpointId, setVolId, &msg);
+      }
+      msgApi->ReleaseMsgID(setVolId);
+   }
+
+private:
+   void Run()
+   {
+      while (true) {
+         {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, std::chrono::milliseconds(200), [this] { return m_stopRequested; });
+            if (m_stopRequested)
+               return;
+         }
+         const std::string body = HttpSender::GetBody("/api/audio-lane-gains");
+         if (body.empty())
+            continue;
+         std::map<std::string, float> changed;
+         try {
+            const auto j = nlohmann::json::parse(body);
+            if (!j.is_object())
+               continue;
+            for (auto it = j.begin(); it != j.end(); ++it) {
+               if (!it.value().is_number())
+                  continue;
+               const float v = it.value().get<float>();
+               const auto prev = m_applied.find(it.key());
+               // Only push real changes: re-broadcasting an unchanged gain 5x a second would
+               // fight VPX's own in-game audio page every time someone used it.
+               if (prev == m_applied.end() || std::abs(prev->second - v) > 0.0005f) {
+                  changed[it.key()] = v;
+                  m_applied[it.key()] = v;
+               }
+            }
+         }
+         catch (...) {
+            continue; // dashboard restarting, or a partial read -- next tick retries
+         }
+         if (changed.empty())
+            continue;
+         {
+            std::lock_guard<std::mutex> lock(gainPollerMutex);
+            if (!gainPollerPending)
+               gainPollerPending = std::make_unique<std::map<std::string, float>>();
+            for (const auto& [k, v] : changed)
+               (*gainPollerPending)[k] = v;
+         }
+         if (msgApi)
+            msgApi->RunOnMainThread(endpointId, 0.0, GainPoller::ApplyPending, nullptr);
+      }
+   }
+
+   std::map<std::string, float> m_applied;
+   std::mutex m_mutex;
+   std::condition_variable m_cv;
+   bool m_stopRequested = false;
+   std::thread m_thread;
+};
+
+static std::unique_ptr<GainPoller> gainPoller;
+
+static void OnAudioUpdate(const unsigned int eventId, void* userData, void* msgData)
+{
+   if (audioMeter && msgData)
+      audioMeter->Accumulate(*static_cast<AudioUpdateMsg*>(msgData));
+}
+
+static void OnAudioSrcChanged(const unsigned int eventId, void* userData, void* msgData)
+{
+   if (audioMeter)
+      audioMeter->RefreshNames();
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -517,6 +853,20 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    onControllersChangedId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_CONTROLLERS_ON_CHG_MSG);
    getControllersId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_CONTROLLERS_GET_MSG);
    msgApi->SubscribeMsg(endpointId, onControllersChangedId, OnControllersChanged, nullptr);
+
+   // Passive tap on the audio broadcast PinMAME/PUP/AltSound already send -- see AudioMeter.
+   audioMeter = std::make_unique<AudioMeter>();
+   onAudioUpdateId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_UPDATE_MSG);
+   onAudioSrcChangedId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_SRC_CHG_MSG);
+   getAudioSrcId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_GET_SRC_MSG);
+   audioMeter->SetGetSrcId(getAudioSrcId);
+   msgApi->SubscribeMsg(endpointId, onAudioUpdateId, OnAudioUpdate, nullptr);
+   msgApi->SubscribeMsg(endpointId, onAudioSrcChangedId, OnAudioSrcChanged, nullptr);
+   audioMeter->RefreshNames(); // sources may already exist if we loaded late
+
+   // Inbound: dashboard fader -> running table's mixer. Started after the ids above exist,
+   // because ApplyPending needs getAudioSrcId to resolve names to sources.
+   gainPoller = std::make_unique<GainPoller>();
 }
 
 MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
@@ -526,6 +876,23 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
       msgApi->ReleaseMsgID(onControllersChangedId);
       msgApi->ReleaseMsgID(getControllersId);
    }
+   if (msgApi && onAudioUpdateId) {
+      msgApi->UnsubscribeMsg(onAudioUpdateId, OnAudioUpdate, nullptr);
+      msgApi->UnsubscribeMsg(onAudioSrcChangedId, OnAudioSrcChanged, nullptr);
+      msgApi->ReleaseMsgID(onAudioUpdateId);
+      msgApi->ReleaseMsgID(onAudioSrcChangedId);
+      msgApi->ReleaseMsgID(getAudioSrcId);
+   }
+   // Stop submitting runnables, THEN flush the ones already queued -- MsgPlugin.h requires that
+   // order on unload, or a marshalled ApplyPending could run after its plugin state is gone.
+   gainPoller = nullptr;
+   if (msgApi)
+      msgApi->FlushPendingCallbacks(endpointId);
+   {
+      std::lock_guard<std::mutex> lock(gainPollerMutex);
+      gainPollerPending = nullptr;
+   }
+   audioMeter = nullptr;           // unsubscribe BEFORE this, so no callback lands on a dead meter
    b2sPluginEventStream = nullptr; // stop the event stream first, so nothing posts to a dying sender
    scorePoller = nullptr;          // ~ScorePoller() joins its thread
    sender = nullptr;               // ~HttpSender() joins its thread, flushing/dropping cleanly

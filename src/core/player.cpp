@@ -778,6 +778,8 @@ Player::Player(PinTable *const table, const PlayMode playMode)
    msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_onAudioUpdatedMsgId, OnAudioUpdated, this);
    msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_onAudioSrcChangedMsgId, OnAudioSrcChanged, this);
    OnAudioSrcChanged(m_onAudioSrcChangedMsgId, this, nullptr);
+   m_setAudioSrcVolMsgId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_SRC_VOL_MSG);
+   msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_setAudioSrcVolMsgId, OnSetAudioSrcVolume, this);
 
    m_getAuxRendererId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_AUX_RENDERER);
    m_onAuxRendererChgId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_EVT_AUX_RENDERER_CHG);
@@ -891,6 +893,8 @@ Player::~Player()
    msgApi->ReleaseMsgID(m_onAudioUpdatedMsgId);
    msgApi->UnsubscribeMsg(m_onAudioSrcChangedMsgId, OnAudioSrcChanged, this);
    msgApi->ReleaseMsgID(m_onAudioSrcChangedMsgId);
+   msgApi->UnsubscribeMsg(m_setAudioSrcVolMsgId, OnSetAudioSrcVolume, this);
+   msgApi->ReleaseMsgID(m_setAudioSrcVolMsgId);
    msgApi->ReleaseMsgID(m_getAudioSrcMsgId);
    msgApi->ReleaseMsgID(m_onPrepareFrameMsgId);
    msgApi->UnsubscribeMsg(m_onAuxRendererChgId, OnAuxRendererChanged, this);
@@ -2445,6 +2449,20 @@ void Player::OnAudioUpdated(const unsigned int msgId, void *userData, void *msgD
          me->m_audioPlayer->EnqueueStream(stream, msg.buffer, msg.bufferSize);
       }
    }
+}
+
+// An external controller asking for a live mixer change (CTLPI_AUDIO_SET_SRC_VOL_MSG).
+// Deliberately does NOT write the setting: the sender owns the persisted value, so the host and
+// an external controller can never end up fighting each other over the ini. The new gain takes
+// effect on the lane's next enqueued buffer (see OnAudioUpdated), i.e. immediately for anything
+// actually making sound.
+void Player::OnSetAudioSrcVolume(const unsigned int msgId, void *userData, void *msgData)
+{
+   if (msgData == nullptr)
+      return;
+   Player *const me = static_cast<Player *>(userData);
+   const SetAudioSrcVolumeMsg &msg = *static_cast<SetAudioSrcVolumeMsg *>(msgData);
+   me->SetAudioLaneMixerVolume(msg.sourceId.id, clamp(msg.volume, 0.f, 2.f));
 }
 
 float Player::GetAudioLaneMixerVolume(uint64_t laneId) const
