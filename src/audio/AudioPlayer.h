@@ -102,6 +102,11 @@ public:
    string GetPlayfieldDeviceName() const { const char * name = SDL_GetAudioDeviceName(m_playfieldAudioDevice); return name ? string(name) : "Error"s; }
    SoundConfigTypes GetSoundMode3D() const { return m_soundMode3D; }
 
+   // Mixed output level of one bus, for the cabinet's audio meters. The playfield bus has no
+   // other observer: its sounds never reach the plugin audio API.
+   struct BusLevel { float rms; float peak; };
+   BusLevel GetBusLevel(bool playfield) const;
+
    struct AudioDevice
    {
       string name;

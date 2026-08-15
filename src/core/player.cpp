@@ -779,6 +779,7 @@ Player::Player(PinTable *const table, const PlayMode playMode)
    msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_onAudioSrcChangedMsgId, OnAudioSrcChanged, this);
    OnAudioSrcChanged(m_onAudioSrcChangedMsgId, this, nullptr);
    m_setAudioSrcVolMsgId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_SRC_VOL_MSG);
+   m_audioBusLevelMsgId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_BUS_LEVEL_MSG);
    msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_setAudioSrcVolMsgId, OnSetAudioSrcVolume, this);
 
    m_getAuxRendererId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_AUX_RENDERER);
@@ -895,6 +896,7 @@ Player::~Player()
    msgApi->ReleaseMsgID(m_onAudioSrcChangedMsgId);
    msgApi->UnsubscribeMsg(m_setAudioSrcVolMsgId, OnSetAudioSrcVolume, this);
    msgApi->ReleaseMsgID(m_setAudioSrcVolMsgId);
+   msgApi->ReleaseMsgID(m_audioBusLevelMsgId);
    msgApi->ReleaseMsgID(m_getAudioSrcMsgId);
    msgApi->ReleaseMsgID(m_onPrepareFrameMsgId);
    msgApi->UnsubscribeMsg(m_onAuxRendererChgId, OnAuxRendererChanged, this);
@@ -2121,6 +2123,23 @@ void Player::PrepareFrame()
    m_startFrameTick = usec();
 
    m_pluginAPI.BroadcastVPXMsg(m_onPrepareFrameMsgId, nullptr);
+
+   // Publish mixed bus levels for external meters. Rate-limited to ~20Hz rather than sent every
+   // frame: a meter cannot show more than that, and this runs on the render thread.
+   if (m_audioPlayer && m_audioBusLevelMsgId)
+   {
+      const uint32_t nowMs = SDL_GetTicks();
+      if (nowMs - m_lastAudioBusLevelMs >= 50)
+      {
+         m_lastAudioBusLevelMs = nowMs;
+         for (const bool playfield : { false, true })
+         {
+            const auto level = m_audioPlayer->GetBusLevel(playfield);
+            AudioBusLevelMsg msg { static_cast<unsigned int>(playfield ? CTLPI_AUDIO_BUS_PLAYFIELD : CTLPI_AUDIO_BUS_BACKGLASS), level.rms, level.peak };
+            m_pluginManager.GetMsgAPI().BroadcastMsg(m_pluginAPI.GetVPXEndPointId(), m_audioBusLevelMsgId, &msg);
+         }
+      }
+   }
 
    // Update visually animated parts (e.g. primitives, reels, gates, lights, bumper-skirts, hittargets, etc)
    if (IsPlaying())

@@ -21,7 +21,40 @@ struct ma_device_ex
    SDL_AudioDeviceID deviceID;
    SDL_AudioStream* stream;
    vector<uint8_t> buffer;
+   // Output level of this device's mixed buffer, for the cabinet's audio meters. Written by the
+   // audio thread, read by the main thread, so they are atomics -- but note the audio callback
+   // is a REALTIME thread: it may only do arithmetic and lock-free stores here, never a lock or
+   // an allocation. Each callback publishes its own block's level rather than accumulating,
+   // which is what a meter displays anyway and keeps the write to two plain stores.
+   std::atomic<float> meterRms { 0.f };
+   std::atomic<float> meterPeak { 0.f };
 };
+
+// Wraps miniaudio's own engine callback to measure what it just mixed. The table's SFX and music
+// never pass through the plugin audio API (that is why they had no live meter), so the only place
+// to see them is the device buffer they are mixed into.
+static void ma_engine_data_callback_metered(ma_device* pDevice, void* pFramesOut, const void* pFramesIn, ma_uint32 frameCount)
+{
+   ma_engine_data_callback_internal(pDevice, pFramesOut, pFramesIn, frameCount);
+   // Devices are configured ma_format_f32 above, so the mixed buffer is plain floats.
+   const ma_uint32 channels = pDevice->playback.channels;
+   const size_t n = static_cast<size_t>(frameCount) * channels;
+   if (pFramesOut == nullptr || n == 0)
+      return;
+   const float* const out = static_cast<const float*>(pFramesOut);
+   float sumSq = 0.f, peak = 0.f;
+   for (size_t i = 0; i < n; ++i)
+   {
+      const float v = out[i];
+      sumSq += v * v;
+      const float a = std::abs(v);
+      if (a > peak)
+         peak = a;
+   }
+   ma_device_ex* const ex = reinterpret_cast<ma_device_ex*>(pDevice);
+   ex->meterRms.store(std::sqrt(sumSq / static_cast<float>(n)), std::memory_order_relaxed);
+   ex->meterPeak.store(peak, std::memory_order_relaxed);
+}
 
 static ma_result ma_context_enumerate_devices__sdl(ma_context* pContext, ma_enum_devices_callback_proc callback, void* pUserData)
 {
@@ -280,7 +313,7 @@ AudioPlayer::AudioPlayer(const string& backglassDevice, const string& playfieldD
          result = ma_engine_init(&engineConfig, m_backglassEngine.get());
          if (result == MA_SUCCESS)
          {
-            m_backglassDevice->device.onData = ma_engine_data_callback_internal;
+            m_backglassDevice->device.onData = ma_engine_data_callback_metered;
             m_backglassDevice->device.pUserData = m_backglassEngine.get();
             ma_engine_start(m_backglassEngine.get());
          }
@@ -324,7 +357,7 @@ AudioPlayer::AudioPlayer(const string& backglassDevice, const string& playfieldD
          result = ma_engine_init(&engineConfig, m_playfieldEngine.get());
          if (result == MA_SUCCESS)
          {
-            m_playfieldDevice->device.onData = ma_engine_data_callback_internal;
+            m_playfieldDevice->device.onData = ma_engine_data_callback_metered;
             m_playfieldDevice->device.pUserData = m_playfieldEngine.get();
             ma_engine_start(m_playfieldEngine.get());
          }
@@ -595,6 +628,14 @@ SoundSpec AudioPlayer::GetSoundInformations(const Sound* const sound) const
 
    ma_decoder_uninit(&decoder);
    return specs;
+}
+
+AudioPlayer::BusLevel AudioPlayer::GetBusLevel(bool playfield) const
+{
+   const ma_device_ex* const dev = playfield ? m_playfieldDevice.get() : m_backglassDevice.get();
+   if (dev == nullptr)
+      return { 0.f, 0.f };
+   return { dev->meterRms.load(std::memory_order_relaxed), dev->meterPeak.load(std::memory_order_relaxed) };
 }
 
 vector<AudioPlayer::AudioDevice> AudioPlayer::EnumerateAudioDevices()

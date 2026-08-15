@@ -251,6 +251,8 @@ private:
    unsigned int m_onAudioUpdatedMsgId;
    unsigned int m_onAudioSrcChangedMsgId;
    unsigned int m_setAudioSrcVolMsgId = 0;
+   unsigned int m_audioBusLevelMsgId = 0;
+   uint32_t m_lastAudioBusLevelMs = 0;
    unsigned int m_getAudioSrcMsgId;
    mutable std::mutex m_audioSourceMutex;
    struct AudioLane

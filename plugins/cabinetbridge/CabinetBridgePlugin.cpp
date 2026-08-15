@@ -391,8 +391,18 @@ public:
 
    void SetGetSrcId(unsigned int id) { m_getSrcId = id; }
 
+   // Bus levels come from the HOST, not from a source: the table's own SFX and music are mixed
+   // straight into the playfield device and never appear as an AudioUpdate, so this is the only
+   // way the playfield lane can have a real meter instead of a permanent, lying zero.
+   void SetBusLevel(unsigned int bus, float rms, float peak)
+   {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_buses[bus] = { rms, peak };
+   }
+
 private:
    struct Lane { double sumSq = 0.0; double peak = 0.0; uint64_t samples = 0; };
+   struct Bus { float rms = 0.f; float peak = 0.f; };
 
    void Run()
    {
@@ -401,6 +411,7 @@ private:
       while (true) {
          std::map<uint64_t, Lane> lanes;
          std::map<uint64_t, std::string> names;
+         std::map<unsigned int, Bus> buses;
          {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait_for(lock, std::chrono::milliseconds(50), [this] { return m_stopRequested; });
@@ -408,8 +419,9 @@ private:
                return;
             lanes.swap(m_lanes);
             names = m_names;
+            buses = m_buses;
          }
-         if (lanes.empty())
+         if (lanes.empty() && buses.empty())
             continue; // silence: say nothing rather than post a wall of zeroes
          std::string json = "{\"lanes\":[";
          bool first = true;
@@ -426,14 +438,25 @@ private:
                      it == names.end() ? "audio" : it->second.c_str(), rms, std::min(lane.peak, 4.0));
             json += buf;
          }
+         json += "],\"buses\":[";
+         bool firstBus = true;
+         for (const auto& [id, bus] : buses)
+         {
+            if (!firstBus) json += ",";
+            firstBus = false;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "{\"bus\":%u,\"rms\":%.5f,\"peak\":%.5f}", id, bus.rms, bus.peak);
+            json += buf;
+         }
          json += "]}";
-         if (!first)
+         if (!first || !firstBus)
             HttpSender::PostJson("/api/audio-levels", json);
       }
    }
 
    std::map<uint64_t, Lane> m_lanes;
    std::map<uint64_t, std::string> m_names;
+   std::map<unsigned int, Bus> m_buses;
    unsigned int m_getSrcId = 0;
    std::mutex m_mutex;
    std::condition_variable m_cv;
@@ -572,6 +595,17 @@ static void OnAudioUpdate(const unsigned int eventId, void* userData, void* msgD
 {
    if (audioMeter && msgData)
       audioMeter->Accumulate(*static_cast<AudioUpdateMsg*>(msgData));
+}
+
+static unsigned int onAudioBusLevelId = 0;
+
+static void OnAudioBusLevel(const unsigned int eventId, void* userData, void* msgData)
+{
+   if (audioMeter && msgData)
+   {
+      const AudioBusLevelMsg& msg = *static_cast<AudioBusLevelMsg*>(msgData);
+      audioMeter->SetBusLevel(msg.bus, msg.rms, msg.peak);
+   }
 }
 
 static void OnAudioSrcChanged(const unsigned int eventId, void* userData, void* msgData)
@@ -862,6 +896,8 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    audioMeter->SetGetSrcId(getAudioSrcId);
    msgApi->SubscribeMsg(endpointId, onAudioUpdateId, OnAudioUpdate, nullptr);
    msgApi->SubscribeMsg(endpointId, onAudioSrcChangedId, OnAudioSrcChanged, nullptr);
+   onAudioBusLevelId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_BUS_LEVEL_MSG);
+   msgApi->SubscribeMsg(endpointId, onAudioBusLevelId, OnAudioBusLevel, nullptr);
    audioMeter->RefreshNames(); // sources may already exist if we loaded late
 
    // Inbound: dashboard fader -> running table's mixer. Started after the ids above exist,
@@ -879,6 +915,8 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
    if (msgApi && onAudioUpdateId) {
       msgApi->UnsubscribeMsg(onAudioUpdateId, OnAudioUpdate, nullptr);
       msgApi->UnsubscribeMsg(onAudioSrcChangedId, OnAudioSrcChanged, nullptr);
+      msgApi->UnsubscribeMsg(onAudioBusLevelId, OnAudioBusLevel, nullptr);
+      msgApi->ReleaseMsgID(onAudioBusLevelId);
       msgApi->ReleaseMsgID(onAudioUpdateId);
       msgApi->ReleaseMsgID(onAudioSrcChangedId);
       msgApi->ReleaseMsgID(getAudioSrcId);

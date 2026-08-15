@@ -343,6 +343,16 @@ typedef struct GetSegSrcMsg
 // the persisted value, so the host can never fight an external controller over the ini.
 #define CTLPI_AUDIO_SET_SRC_VOL_MSG "SetAudioSrcVolume"
 
+// Broadcast by the HOST each frame with the mixed output level of each audio bus, message data
+// is a pointer to an AudioBusLevelMsg. Added for pinball_cab. Unlike the per-source levels a
+// plugin can measure for itself from CTLPI_AUDIO_ON_UPDATE_MSG, the table's own SFX and music
+// never pass through the plugin audio API at all -- they are mixed straight into the playfield
+// device -- so the host is the only thing that can see them.
+#define CTLPI_AUDIO_ON_BUS_LEVEL_MSG "AudioBusLevel"
+
+#define CTLPI_AUDIO_BUS_BACKGLASS            0
+#define CTLPI_AUDIO_BUS_PLAYFIELD            1
+
 #define CTLPI_AUDIO_TARGET_BACKGLASS         0
 
 #define CTLPI_AUDIO_FORMAT_CHANNEL_MONO      0
@@ -374,6 +384,13 @@ typedef struct GetAudioSrcMsg
 // - Enqueueing in an existing stream: bufferSize & buffer and volume must be defined (other fields are ignored)
 // - Destroying an existing stream: buffer must be null (other fields are ignored)
 // For all these use cases, source and stream must always be defined and valid.
+typedef struct AudioBusLevelMsg
+{
+   unsigned int bus;             // Which bus this level is for (see CTLPI_AUDIO_BUS_xxx)
+   float rms;                    // RMS of the last mixed block, 0..1 nominal
+   float peak;                   // Peak sample of the last mixed block, 0..1 nominal
+} AudioBusLevelMsg;
+
 typedef struct SetAudioSrcVolumeMsg
 {
    CtlResId sourceId;            // Audio source whose mixer gain to change
