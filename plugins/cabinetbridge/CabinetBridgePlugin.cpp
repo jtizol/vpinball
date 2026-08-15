@@ -432,10 +432,15 @@ private:
             if (!first) json += ",";
             first = false;
             const auto it = names.find(id);
+            // Skip a lane we cannot name yet rather than labelling it "audio". The dashboard
+            // gives every reported lane a row, and a placeholder name produced a phantom lane
+            // with a fader wired to nothing. Names resolve on OnAudioSrcChanged, so an
+            // unresolved id is transient and the lane appears properly a moment later.
+            if (it == names.end())
+               continue;
             char buf[192];
             snprintf(buf, sizeof(buf), "{\"id\":%llu,\"name\":\"%s\",\"rms\":%.5f,\"peak\":%.5f}",
-                     static_cast<unsigned long long>(id),
-                     it == names.end() ? "audio" : it->second.c_str(), rms, std::min(lane.peak, 4.0));
+                     static_cast<unsigned long long>(id), it->second.c_str(), rms, std::min(lane.peak, 4.0));
             json += buf;
          }
          json += "],\"buses\":[";
