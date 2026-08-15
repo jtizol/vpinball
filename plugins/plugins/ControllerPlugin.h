@@ -350,6 +350,13 @@ typedef struct GetSegSrcMsg
 // device -- so the host is the only thing that can see them.
 #define CTLPI_AUDIO_ON_BUS_LEVEL_MSG "AudioBusLevel"
 
+// Broadcast to ask the host to change a BUS master volume live, message data is a pointer to a
+// SetAudioBusVolumeMsg. The counterpart of CTLPI_AUDIO_SET_SRC_VOL_MSG for the two bus masters
+// (SoundVolume / MusicVolume), which were previously read once at player init -- so an external
+// mixer could move a source but not the master above it. Applied live, never persisted: the
+// sender owns the stored value.
+#define CTLPI_AUDIO_SET_BUS_VOL_MSG "SetAudioBusVolume"
+
 #define CTLPI_AUDIO_BUS_BACKGLASS            0
 #define CTLPI_AUDIO_BUS_PLAYFIELD            1
 
@@ -390,6 +397,12 @@ typedef struct AudioBusLevelMsg
    float rms;                    // RMS of the last mixed block, 0..1 nominal
    float peak;                   // Peak sample of the last mixed block, 0..1 nominal
 } AudioBusLevelMsg;
+
+typedef struct SetAudioBusVolumeMsg
+{
+   unsigned int bus;             // Which bus to change (see CTLPI_AUDIO_BUS_xxx)
+   float volume;                 // New master volume, 0..1
+} SetAudioBusVolumeMsg;
 
 typedef struct SetAudioSrcVolumeMsg
 {

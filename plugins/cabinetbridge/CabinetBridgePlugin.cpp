@@ -522,6 +522,17 @@ public:
       std::vector<AudioSrcId> srcs;
       GetCtrlItems<AudioSrcId>(msgApi, endpointId, getAudioSrcId, srcs);
 
+      // Bus masters are keyed "bus:0"/"bus:1" in the same map, because they arrive through the
+      // same poll and there is no sane source name they could collide with.
+      const unsigned int setBusVolId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_BUS_VOL_MSG);
+      for (const auto& [key, value] : pending) {
+         if (key.rfind("bus:", 0) != 0)
+            continue;
+         SetAudioBusVolumeMsg busMsg { static_cast<unsigned int>(std::stoul(key.substr(4))), value };
+         msgApi->BroadcastMsg(endpointId, setBusVolId, &busMsg);
+      }
+      msgApi->ReleaseMsgID(setBusVolId);
+
       const unsigned int setVolId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_SRC_VOL_MSG);
       for (const auto& src : srcs) {
          const std::string name = (src.name && *src.name) ? src.name : "";

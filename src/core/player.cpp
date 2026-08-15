@@ -780,6 +780,8 @@ Player::Player(PinTable *const table, const PlayMode playMode)
    OnAudioSrcChanged(m_onAudioSrcChangedMsgId, this, nullptr);
    m_setAudioSrcVolMsgId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_SRC_VOL_MSG);
    m_audioBusLevelMsgId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_BUS_LEVEL_MSG);
+   m_setAudioBusVolMsgId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_SET_BUS_VOL_MSG);
+   msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_setAudioBusVolMsgId, OnSetAudioBusVolume, this);
    msgApi->SubscribeMsg(m_pluginAPI.GetVPXEndPointId(), m_setAudioSrcVolMsgId, OnSetAudioSrcVolume, this);
 
    m_getAuxRendererId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_AUX_RENDERER);
@@ -897,6 +899,8 @@ Player::~Player()
    msgApi->UnsubscribeMsg(m_setAudioSrcVolMsgId, OnSetAudioSrcVolume, this);
    msgApi->ReleaseMsgID(m_setAudioSrcVolMsgId);
    msgApi->ReleaseMsgID(m_audioBusLevelMsgId);
+   msgApi->UnsubscribeMsg(m_setAudioBusVolMsgId, OnSetAudioBusVolume, this);
+   msgApi->ReleaseMsgID(m_setAudioBusVolMsgId);
    msgApi->ReleaseMsgID(m_getAudioSrcMsgId);
    msgApi->ReleaseMsgID(m_onPrepareFrameMsgId);
    msgApi->UnsubscribeMsg(m_onAuxRendererChgId, OnAuxRendererChanged, this);
@@ -2476,6 +2480,23 @@ void Player::OnAudioUpdated(const unsigned int msgId, void *userData, void *msgD
          me->m_audioPlayer->EnqueueStream(stream, msg.buffer, msg.bufferSize);
       }
    }
+}
+
+// A bus master moved from outside. m_playfieldVolume / m_backglassVolume were previously read
+// once at player init, which is why the dashboard's master sliders only took effect at the next
+// launch. Same no-persist rule as the per-source version.
+void Player::OnSetAudioBusVolume(const unsigned int msgId, void *userData, void *msgData)
+{
+   if (msgData == nullptr)
+      return;
+   Player *const me = static_cast<Player *>(userData);
+   const SetAudioBusVolumeMsg &msg = *static_cast<SetAudioBusVolumeMsg *>(msgData);
+   const float v = clamp(msg.volume, 0.f, 1.f);
+   if (msg.bus == CTLPI_AUDIO_BUS_PLAYFIELD)
+      me->m_playfieldVolume = v;
+   else
+      me->m_backglassVolume = v;
+   me->UpdateVolume();
 }
 
 // An external controller asking for a live mixer change (CTLPI_AUDIO_SET_SRC_VOL_MSG).
