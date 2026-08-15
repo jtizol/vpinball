@@ -360,6 +360,10 @@ AudioPlayer::~AudioPlayer()
       ma_device_uninit(&m_backglassDevice->device);
    if (m_maContext)
       ma_context_uninit(m_maContext.get());
+   for (const auto& [name, dev] : m_laneSDLDevices)
+      if (dev != 0 && dev != m_backglassSDLDevice) // a fallback entry aliases the backglass device
+         SDL_CloseAudioDevice(dev);
+   m_laneSDLDevices.clear();
    if (m_backglassSDLDevice != 0)
       SDL_CloseAudioDevice(m_backglassSDLDevice);
    SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -378,7 +382,46 @@ void AudioPlayer::SetMainVolume(float backglassVolume, float playfieldVolume)
       player->SetMainVolume(backglassVolume);
 }
 
-AudioPlayer::AudioStreamID AudioPlayer::OpenAudioStream(const string& name, int frequency, int channels, bool isFloat)
+// Resolve a lane's requested output to an open SDL device, opening and caching it on first use.
+// An unknown or unavailable name falls back to the backglass device rather than failing: losing
+// a sound entirely because a USB interface was unplugged is much worse than playing it on the
+// default output, and the name is user-supplied config that can legitimately go stale.
+SDL_AudioDeviceID AudioPlayer::GetOrOpenLaneDevice(const string& deviceName)
+{
+   if (deviceName.empty())
+      return m_backglassSDLDevice;
+   const auto it = m_laneSDLDevices.find(deviceName);
+   if (it != m_laneSDLDevices.end())
+      return it->second;
+   SDL_AudioDeviceID opened = 0;
+   int count = 0;
+   if (SDL_AudioDeviceID* const devices = SDL_GetAudioPlaybackDevices(&count))
+   {
+      for (int i = 0; i < count; ++i)
+      {
+         const char* const n = SDL_GetAudioDeviceName(devices[i]);
+         if (n && deviceName == n)
+         {
+            SDL_AudioSpec spec;
+            const bool hasSpec = SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr);
+            opened = SDL_OpenAudioDevice(devices[i], hasSpec ? &spec : nullptr);
+            break;
+         }
+      }
+      SDL_free(devices);
+   }
+   if (opened == 0)
+   {
+      PLOGE << "Audio lane device '" << deviceName << "' not available, falling back to backglass output";
+      opened = m_backglassSDLDevice;
+   }
+   else
+      PLOGI << "Opened audio lane device '" << deviceName << '\'';
+   m_laneSDLDevices[deviceName] = opened;
+   return opened;
+}
+
+AudioPlayer::AudioStreamID AudioPlayer::OpenAudioStream(const string& name, int frequency, int channels, bool isFloat, const string& deviceName)
 {
    if (m_backglassSDLDevice == 0)
    {
@@ -386,7 +429,8 @@ AudioPlayer::AudioStreamID AudioPlayer::OpenAudioStream(const string& name, int 
       const bool hasDeviceSpec = SDL_GetAudioDeviceFormat(m_backglassAudioDevice, &deviceSpec, nullptr);
       m_backglassSDLDevice = SDL_OpenAudioDevice(m_backglassAudioDevice, hasDeviceSpec ? & deviceSpec : nullptr);
    }
-   std::unique_ptr<AudioStreamPlayer> audioStream = AudioStreamPlayer::Create(m_backglassSDLDevice, frequency, channels, isFloat);
+   const SDL_AudioDeviceID laneDevice = GetOrOpenLaneDevice(deviceName);
+   std::unique_ptr<AudioStreamPlayer> audioStream = AudioStreamPlayer::Create(laneDevice, frequency, channels, isFloat);
    if (audioStream == nullptr)
       return nullptr;
    AudioStreamID stream = std::move(audioStream);

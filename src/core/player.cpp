@@ -2371,7 +2371,15 @@ void Player::OnAudioSrcChanged(const unsigned int msgId, void *userData, void *m
          const auto propPropId = Settings::GetRegistry().Register(std::make_unique<VPX::Properties::FloatPropertyDef>(
             "Player"s, propId, std::format("{} Gain", endpointName), std::format("Volume gain applied to audio from '{}'.", endpointName), true, 0.f, 2.f, 0.f, 1.f));
          const float persistedVolume = me->m_ptable->m_settings.GetFloat(propPropId);
-         me->m_audioLanes[audioSrc.id.id] = { audioSrc, false, persistedVolume };
+         // Per-lane output routing. Registered next to the gain so both show up in the in-game
+         // audio page and in the ini under the same AudioSource.<endpoint>.* prefix. Empty means
+         // "the backglass device", i.e. exactly the behaviour every lane had before routing.
+         const string devPropId = std::format("AudioSource.{}.Device", endpointId);
+         const auto devProp = Settings::GetRegistry().Register(std::make_unique<VPX::Properties::StringPropertyDef>(
+            "Player"s, devPropId, std::format("{} Output", endpointName),
+            std::format("Audio output device used for '{}' (empty = backglass output).", endpointName), true, ""s));
+         const string persistedDevice = me->m_ptable->m_settings.GetString(devProp);
+         me->m_audioLanes[audioSrc.id.id] = { audioSrc, false, persistedVolume, persistedDevice };
       }
 
    }
@@ -2441,7 +2449,7 @@ void Player::OnAudioUpdated(const unsigned int msgId, void *userData, void *msgD
       case CTLPI_AUDIO_FORMAT_SAMPLE_FLOAT: isFloat = true; break;
       default: return;
       }
-      const auto stream = me->m_audioPlayer->OpenAudioStream(std::format("{}.{:04X}", laneIt->second.source.name, msg.streamId.resId), static_cast<int>(msg.sampleRate), nChannels, isFloat);
+      const auto stream = me->m_audioPlayer->OpenAudioStream(std::format("{}.{:04X}", laneIt->second.source.name, msg.streamId.resId), static_cast<int>(msg.sampleRate), nChannels, isFloat, laneIt->second.outputDevice);
       if (stream)
       {
          lane.streams[msg.streamId.id] = stream;

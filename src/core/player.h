@@ -258,6 +258,9 @@ private:
       AudioSrcId source = { };
       bool overriden = false;
       float mixerVolume = 1.f;
+      // Physical output this lane's streams are bound to; empty = the backglass device. Read
+      // once when the lane appears, so a change takes effect on the lane's next stream.
+      string outputDevice;
       ankerl::unordered_dense::map<uint64_t, VPX::AudioPlayer::AudioStreamID> streams;
    };
    ankerl::unordered_dense::map<uint64_t, AudioLane> m_audioLanes;

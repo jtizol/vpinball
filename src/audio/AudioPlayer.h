@@ -75,7 +75,10 @@ public:
 
    // Audio stream, directly forwarded to audio device, respecting channel assignment, applying backglass global volume
    using AudioStreamID = std::shared_ptr<class AudioStreamPlayer>; // opaque pointer as objects are always owned by AudioPlayer without any public API
-   AudioStreamID OpenAudioStream(const string& name, int frequency, int channels, bool isFloat);
+   // `deviceName` selects the physical output this stream is bound to; empty means the backglass
+   // device, which is what every caller used before per-lane routing existed. Devices are opened
+   // lazily and cached, so routing two lanes to the same output shares one device.
+   AudioStreamID OpenAudioStream(const string& name, int frequency, int channels, bool isFloat, const string& deviceName = string());
    bool IsOpened(const AudioStreamID& stream) const;
    void EnqueueStream(const AudioStreamID& stream, uint8_t* buffer, int length) const;
    void SetStreamVolume(const AudioStreamID& stream, const float volume) const;
@@ -124,6 +127,10 @@ private:
    vector<AudioStreamID> m_audioStreams;
    vector<AudioStreamID> m_pendingDeleteAudioStreams;
    SDL_AudioDeviceID m_backglassSDLDevice = 0;
+   // Extra output devices opened for lanes routed away from the backglass, keyed by device name.
+   // Separate from m_backglassSDLDevice so the default path is byte-for-byte what it always was.
+   ankerl::unordered_dense::map<string, SDL_AudioDeviceID> m_laneSDLDevices;
+   SDL_AudioDeviceID GetOrOpenLaneDevice(const string& deviceName);
 
    std::unique_ptr<class SoundPlayer> m_music;
 
