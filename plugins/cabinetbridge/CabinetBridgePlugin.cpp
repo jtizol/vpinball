@@ -116,6 +116,8 @@ static std::atomic<uint64_t> lockSinceMs { 0 };    // when this lock first went 
 static std::atomic<uint64_t> lockCeilingMs { 180000 }; // the server's own MAX_LOCK_MS
 static std::atomic<uint64_t> startPressedAtMs { 0 };
 static std::atomic<bool> overrideRequested { false };
+// A Start press that the veto swallowed, waiting to be reported from the poller thread.
+static std::atomic<bool> startSwallowed { false };
 // What the plugin last TOLD the bus about itself. Announcements are driven by the EFFECTIVE
 // veto (StartIsVetoed), sampled on the poller thread -- never by what the server said. Those
 // two differ in exactly the cases that matter: a dashboard that went quiet, or a lock that
@@ -1021,6 +1023,10 @@ private:
             "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start held -- cabinet forced open\","
             "\"detail\":\"override from the machine itself\"}");
       }
+      if (startSwallowed.exchange(false))
+         HttpSender::PostJson("/api/emit",
+            "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start ignored -- not your turn\","
+            "\"detail\":\"the button was pressed while the cabinet was locked\"}");
       // Sampled every tick (~200ms), not just when the server speaks -- a fail-open is a
       // transition nobody sent us, and it is the one most worth seeing on the bus.
       const bool veto = StartIsVetoed();
@@ -1197,8 +1203,15 @@ static void OnActionChanged(const unsigned int eventId, void* userData, void* ms
 
    if (!StartIsVetoed())
       return;
+   const bool wasPress = ev->isPressed != 0; // read BEFORE we clear it
    ev->isPressed = 0;
    ev->enableVPXProcessing = 0;
+   // Say so, on the press edge only. Two reasons, and the second is why this is permanent
+   // rather than debug instrumentation: a player who pressed Start and got nothing deserves an
+   // answer, and this is the ONLY way the veto can be observed at all -- no test can press a
+   // physical button, so the machine reporting its own refusal is the evidence.
+   if (wasPress)
+      startSwallowed.store(true);
 }
 
 static void OnControllersChanged(const unsigned int eventId, void* userData, void* msgData)

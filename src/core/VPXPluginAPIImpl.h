@@ -81,6 +81,20 @@ private:
    static void MSGPIAPI SetInputState(VPXInputState* state);
    ankerl::unordered_dense::map<VPXAction, std::pair<unsigned int, int>> m_actionMap;
 
+public:
+   // Reverse of m_actionMap: an internal action id back to the VPXAction plugins know it by.
+   // Needed because an action id is just its registration index, which does NOT match the enum
+   // (four UI* actions the enum lacks, four credit slots against the enum's two). Linear over
+   // ~20 entries, called once per input state change -- a reverse map would be a second thing
+   // to keep in step, which is the bug this exists to fix.
+   bool ToVPXAction(unsigned int actionId, VPXAction& out) const
+   {
+      for (const auto& [vpxAction, entry] : m_actionMap)
+         if (entry.first == actionId) { out = vpxAction; return true; }
+      return false;
+   }
+private:
+
    static double MSGPIAPI GetGameTime();
 
    static VPXTexture MSGPIAPI CreateTexture(uint8_t* rawData, int size);

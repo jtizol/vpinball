@@ -1031,10 +1031,33 @@ void InputManager::Unregister(ButtonMapping* mapping)
       std::erase(it->second, mapping);
 }
 
-// Allow plugins to react to action event, eventually disabling local processing
+// Map an internal action id to the VPXAction a plugin sees.
+//
+// This used to be a static_cast of the action id straight to VPXAction, which is wrong: an
+// action id is just its registration index (see AddAction), and the registration order does not
+// match the enum. Registration inserts four UI* actions the enum has no entries for, and four
+// credit actions where the enum has two -- so no fixed offset can reconcile them either.
+//
+// Measured on this build: "Start" registers at index 19, while VPXACTION_StartGame is 13. A
+// plugin watching for StartGame therefore never saw the Start button, and index 13 is
+// CenterNudge -- so a plugin vetoing "StartGame" was in fact swallowing the space bar. Both
+// failures are silent, which is why this went unnoticed: nothing errors, the wrong key just
+// quietly does the wrong thing.
+//
+// The translation is a REVERSE LOOKUP over VPXPluginAPIImpl's existing m_actionMap, not a table
+// of its own. That map is already the engine's answer to "which action id is VPXACTION_x" --
+// GetInputState and SetInputState have always used it. Writing a second table here would be a
+// second source of truth for the same fact, which is how the two sides drifted apart to begin
+// with; if an action is added to one path it must appear on the other by construction.
+//
+// An action with no enum entry is simply not broadcast -- plugins get the actions the API
+// names, and nothing else.
 bool InputManager::OnInputActionStateChanged(InputAction* action)
 {
-   VPXActionEvent event { static_cast<VPXAction>(action->GetActionId()), action->IsPressed(), 1 };
+   VPXAction vpxAction;
+   if (!m_player->m_pluginAPI.ToVPXAction(action->GetActionId(), vpxAction))
+      return true; // not an action the plugin API names -- process it locally, unannounced
+   VPXActionEvent event { vpxAction, action->IsPressed(), 1 };
    m_player->m_pluginAPI.BroadcastVPXMsg(m_onActionEventMsgId, &event);
    return event.enableVPXProcessing != 0;
 }

@@ -571,7 +571,11 @@ void VPXPluginAPIImpl::OnGameStart()
    m_actionMap[VPXACTION_StartGame] = { inputManager.GetStartActionId(), -1 };
    m_actionMap[VPXACTION_Lockbar] = { inputManager.GetLockbarActionId(), -1 };
    //m_actionMap[VPXACTION_Pause] = { inputManager.GetPauseActionId(), -1 };
-   m_actionMap[VPXACTION_PerfOverlay] = { inputManager.GetLeftFlipperActionId(), -1 };
+   // VPXACTION_PerfOverlay deliberately absent: it was mapped to GetLeftFlipperActionId(), a
+   // copy-paste that made SetInputState(PerfOverlay) press the LEFT FLIPPER, and gave the left
+   // flipper's id two names in this map. Left out rather than guessed at, exactly like Pause /
+   // InGameUI / the VR actions below, none of which have an accessor to map to either.
+   //m_actionMap[VPXACTION_PerfOverlay] = { inputManager.GetPerfOverlayActionId(), -1 };
    m_actionMap[VPXACTION_OpenInGameUI] = { inputManager.GetOpenInGameUIActionId(), -1 };
    m_actionMap[VPXACTION_ExitGame] = { inputManager.GetExitGameActionId(), -1 };
    //m_actionMap[VPXACTION_InGameUI] = { inputManager.GetIn(), -1 };
