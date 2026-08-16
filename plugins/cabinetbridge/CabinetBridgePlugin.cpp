@@ -651,6 +651,55 @@ struct ScoreField
    int length;       // number of BCD-encoded bytes (2 decimal digits each)
 };
 
+// One game_state field that isn't a score -- game_over, current_ball, and friends. Separate
+// from ScoreField because these are the SESSION's shape (did a game start, is it still going,
+// did it reach the last ball) rather than its result, they aren't all BCD, and only these can
+// be false/zero as a meaningful value rather than as "not read".
+//
+// WHY THESE ARE WORTH READING AT ALL: the dashboard has to record only games that were played
+// end to end, and inferring that from drain events is guesswork -- the ROM already knows. See
+// docs/decisions/table-sessions-and-queue.md in the pinball_cab repo.
+//
+// WARNING, and it is not a small one: on both platforms we have maps for, these fields live in
+// LOW working RAM (addresses 135-950 on WPC), not in the battery-backed region the scores are
+// in. They are only meaningful while the CPU is running. A saved .nv file's copy of them is
+// whatever happened to be resident at dump time -- verified 2026-08-16 with the repo's
+// scripts/nvram-state.py, which reads mm_109c.nv as game_over=false AND current_ball=0, a flat
+// contradiction, on perfect checksums. That is exactly why this is polled live here and cannot
+// be recovered from disk afterwards.
+struct StateField
+{
+   std::string key;   // the name the dashboard sees, e.g. "gameOver"
+   uint32_t offset;
+   int length;
+   char encoding;     // 'i' int (big-endian), 'b' bcd, 'o' bool
+   bool invert;       // bool only: bttf's game_over is "current player is 0", inverted
+};
+
+// Everything one ROM's memmap gives us, parsed in one pass. Both halves come from the same
+// file and the same base-address computation, so they resolve together rather than through two
+// near-identical loaders that could disagree about the offset.
+struct RomMap
+{
+   std::vector<ScoreField> scores;
+   std::vector<StateField> state;
+   bool empty() const { return scores.empty() && state.empty(); }
+};
+
+// The game_state keys worth forwarding, mapped to the camelCase name the dashboard uses.
+// Deliberately a fixed list rather than "forward every field in the map": the maps also carry
+// audits, volume, replay levels and per-mode champions, none of which a session state machine
+// wants and all of which would be noise on the event bus.
+static const std::pair<const char*, const char*> STATE_KEYS[] = {
+   { "game_over", "gameOver" },
+   { "current_player", "player" },
+   { "current_ball", "ball" },
+   { "player_count", "players" },
+   { "ball_count", "ballCount" },
+   { "credits", "credits" },
+   { "free_play", "freePlay" },
+};
+
 // ~/.pinmame/memmaps, matching this project's existing convention (CLAUDE.md: everything
 // PinMAME-related lives under ~/.pinmame/) and, deliberately, the SAME directory
 // plugins/pinmame/Controller.cpp already scans for a memmap (see its own PinmameSetMemMap
@@ -677,30 +726,30 @@ static uint32_t ParseAddr(const nlohmann::json& v)
    return 0;
 }
 
-// Loads romName's score-field byte layout from ~/.pinmame/memmaps. Returns an empty vector
-// (score forwarding silently does nothing, same as every other optional piece of this
-// plugin) if no memmap is set up for this ROM, or on any parse error -- a malformed/missing
-// file must never crash the plugin, just degrade to "no score events."
-// Only "scores" array entries labeled "Player <n>" with "bcd" encoding are used -- other
-// game_state fields (credits, ball, player_count, ...) and other encodings are deliberately
-// left unparsed; this is scoped to exactly what CabinetBridge forwards as "score", not a
-// general-purpose memmap reader.
-static std::vector<ScoreField> LoadScoreFields(const std::string& romName)
+// Loads romName's byte layout from ~/.pinmame/memmaps: the per-player score fields, and the
+// game_state fields named in STATE_KEYS above. Returns an empty map (forwarding silently does
+// nothing, same as every other optional piece of this plugin) if no memmap is set up for this
+// ROM, or on any parse error -- a malformed/missing file must never crash the plugin, just
+// degrade to "no events."
+// Still deliberately NOT a general-purpose memmap reader: only "scores" entries labeled
+// "Player <n>" with "bcd" encoding, and only the fixed STATE_KEYS list, are parsed. Everything
+// else in a map file (audits, champions, volume) stays unread.
+static RomMap LoadRomMap(const std::string& romName)
 {
-   std::vector<ScoreField> fields;
+   RomMap romMap;
    try {
       const std::filesystem::path dir = MemmapsDir();
       std::ifstream indexFile(dir / "index.json");
       if (!indexFile.is_open())
-         return fields;
+         return romMap;
       nlohmann::json index;
       indexFile >> index;
       if (!index.is_object() || !index.contains(romName) || !index[romName].is_string())
-         return fields;
+         return romMap;
 
       std::ifstream mapFile(dir / index[romName].get<std::string>());
       if (!mapFile.is_open())
-         return fields;
+         return romMap;
       nlohmann::json map;
       mapFile >> map;
 
@@ -725,10 +774,36 @@ static std::vector<ScoreField> LoadScoreFields(const std::string& romName)
          }
       }
 
-      if (!map.contains("game_state") || !map["game_state"].contains("scores") || !map["game_state"]["scores"].is_array())
-         return fields;
+      if (!map.contains("game_state") || !map["game_state"].is_object())
+         return romMap;
+      const auto& gameState = map["game_state"];
 
-      for (const auto& entry : map["game_state"]["scores"]) {
+      // The session fields. Each is optional: a map missing current_ball still yields useful
+      // scores, and the dashboard is told which keys it actually got rather than being handed
+      // a zero it would have to treat as real.
+      for (const auto& [mapKey, outKey] : STATE_KEYS) {
+         if (!gameState.contains(mapKey) || !gameState[mapKey].is_object())
+            continue;
+         const auto& entry = gameState[mapKey];
+         if (!entry.contains("start"))
+            continue;
+         const std::string enc = entry.value("encoding", std::string());
+         char encoding = 0;
+         if (enc == "int") encoding = 'i';
+         else if (enc == "bcd") encoding = 'b';
+         else if (enc == "bool") encoding = 'o';
+         else continue; // an encoding we don't decode is skipped, never guessed at
+         const uint32_t addr = ParseAddr(entry["start"]);
+         const int length = entry.value("length", 1);
+         if (addr < nvramBase || length <= 0)
+            continue;
+         romMap.state.push_back({ outKey, addr - nvramBase, length, encoding, entry.value("invert", false) });
+      }
+
+      if (!gameState.contains("scores") || !gameState["scores"].is_array())
+         return romMap;
+
+      for (const auto& entry : gameState["scores"]) {
          if (!entry.contains("label") || !entry["label"].is_string())
             continue;
          if (entry.value("encoding", std::string()) != "bcd")
@@ -744,12 +819,16 @@ static std::vector<ScoreField> LoadScoreFields(const std::string& romName)
          const int length = entry.value("length", 1);
          if (addr < nvramBase || length <= 0)
             continue;
-         fields.push_back({ playerNo, addr - nvramBase, length });
+         romMap.scores.push_back({ playerNo, addr - nvramBase, length });
       }
    } catch (...) {
-      fields.clear(); // malformed/missing memmap files degrade to "no score forwarding", never crash
+      // malformed/missing memmap files degrade to "no forwarding", never crash. Both halves are
+      // cleared together: a partially-parsed map is the one state that could produce confident,
+      // wrong session boundaries.
+      romMap.scores.clear();
+      romMap.state.clear();
    }
-   return fields;
+   return romMap;
 }
 
 // Big-endian BCD decode per the pinball-memory-maps spec: each byte holds two decimal digits
@@ -766,6 +845,25 @@ static int DecodeBcd(const uint8_t* nvram, size_t nvramLen, const ScoreField& fi
       const int hi = (b >> 4) & 0xF, lo = b & 0xF;
       value = value * 100 + (hi <= 9 ? hi : 0) * 10 + (lo <= 9 ? lo : 0);
    }
+   return static_cast<int>(value);
+}
+
+// Decode one game_state field. Returns -1 for out-of-range, same "not read" convention
+// DecodeBcd uses -- which is why bools come back as 0/1 rather than as a C++ bool: the caller
+// has to be able to tell "false" from "never read it".
+static int DecodeState(const uint8_t* nvram, size_t nvramLen, const StateField& field)
+{
+   if (field.offset + static_cast<uint32_t>(field.length) > nvramLen)
+      return -1;
+   if (field.encoding == 'b')
+      return DecodeBcd(nvram, nvramLen, { 0, field.offset, field.length });
+   if (field.encoding == 'o') {
+      const bool set = nvram[field.offset] != 0;
+      return (field.invert ? !set : set) ? 1 : 0;
+   }
+   long value = 0; // 'i': big-endian, both platforms we have maps for
+   for (int i = 0; i < field.length; i++)
+      value = value * 256 + nvram[field.offset + i];
    return static_cast<int>(value);
 }
 
@@ -790,27 +888,29 @@ public:
    ScorePoller(const ScorePoller&) = delete;
    ScorePoller& operator=(const ScorePoller&) = delete;
 
-   void SetFields(std::vector<ScoreField> fields)
+   void SetMap(RomMap romMap)
    {
       std::lock_guard<std::mutex> lock(m_mutex);
-      m_fields = std::move(fields);
-      m_lastValues.assign(m_fields.size(), -1);
+      m_map = std::move(romMap);
+      m_lastValues.assign(m_map.scores.size(), -1);
+      m_lastState.clear(); // a ROM switch must re-announce state, not diff against the old table's
    }
 
 private:
    void Run()
    {
       while (true) {
-         std::vector<ScoreField> fields;
+         RomMap romMap;
          {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait_for(lock, std::chrono::milliseconds(200), [this] { return m_stopRequested; });
             if (m_stopRequested)
                return;
-            fields = m_fields;
+            romMap = m_map;
          }
-         if (fields.empty())
+         if (romMap.empty())
             continue;
+         const std::vector<ScoreField>& fields = romMap.scores;
 
          const int maxLen = PinmameGetMaxNVRAM();
          if (maxLen <= 0)
@@ -824,8 +924,9 @@ private:
             bytes[i] = raw[i].currStat;
 
          std::lock_guard<std::mutex> lock(m_mutex);
-         if (fields.size() != m_fields.size())
+         if (fields.size() != m_map.scores.size())
             continue; // fields changed mid-poll (ROM switch) -- skip this tick, next one is consistent
+         PollState(romMap, bytes);
          for (size_t i = 0; i < fields.size(); i++) {
             const int value = DecodeBcd(bytes.data(), bytes.size(), fields[i]);
             if (value < 0 || value == m_lastValues[i])
@@ -840,12 +941,66 @@ private:
       }
    }
 
+   // Emits a "gamestate" event whenever the SESSION's shape changes -- a game started or ended,
+   // the ball or player advanced, a credit was added. Caller holds m_mutex.
+   //
+   // WHY SCORES RIDE ALONG BUT DON'T TRIGGER IT: the change test deliberately ignores scores.
+   // Including them would make this fire as often as a score event does (constantly, mid-ball),
+   // and the whole reason a named/structured event can be persisted at all is that it's rare --
+   // see table-events.json's persistence-budget rule. But the snapshot still CARRIES the scores,
+   // because the one moment that matters most is the game_over edge, and a final score read from
+   // a separate event arriving separately is a final score that can be torn by a poll boundary.
+   // Riding along makes "the game ended, and here is what everyone finished on" one atomic fact.
+   void PollState(const RomMap& romMap, const std::vector<uint8_t>& bytes)
+   {
+      if (romMap.state.empty() || !m_sender)
+         return;
+
+      std::map<std::string, int> now;
+      for (const StateField& field : romMap.state) {
+         const int value = DecodeState(bytes.data(), bytes.size(), field);
+         if (value >= 0)
+            now[field.key] = value;
+      }
+      if (now.empty() || now == m_lastState)
+         return;
+      m_lastState = now;
+
+      nlohmann::json state(now);
+      nlohmann::json scores = nlohmann::json::array();
+      for (const ScoreField& field : romMap.scores) {
+         const int value = DecodeBcd(bytes.data(), bytes.size(), field);
+         if (value >= 0)
+            scores.push_back({ { "player", field.playerNo }, { "score", value } });
+      }
+      state["scores"] = scores;
+
+      // type/tag/label/detail so this reads on the event bus like every other forwarded event,
+      // plus `state` -- real keys, never packed into the display strings, per the structured-
+      // fields rule in docs/decisions/table-events.md. The dashboard's session state machine
+      // reads `state`; the bus just shows the label.
+      const auto at = [&now](const char* key) { const auto it = now.find(key); return it == now.end() ? -1 : it->second; };
+      char label[96];
+      if (at("gameOver") == 1)
+         snprintf(label, sizeof(label), "attract");
+      else
+         snprintf(label, sizeof(label), "player %d/%d · ball %d/%d",
+            at("player"), at("players"), at("ball"), at("ballCount"));
+
+      nlohmann::json event = {
+         { "type", "gamestate" }, { "tag", "GAME" },
+         { "label", label }, { "detail", "" }, { "state", state },
+      };
+      HttpSender::PostJson("/api/emit", event.dump());
+   }
+
    HttpSender* m_sender;
    std::mutex m_mutex;
    std::condition_variable m_cv;
    bool m_stopRequested = false;
-   std::vector<ScoreField> m_fields;
+   RomMap m_map;
    std::vector<int> m_lastValues;
+   std::map<std::string, int> m_lastState;
    std::thread m_thread;
 };
 
@@ -856,9 +1011,10 @@ static std::string currentRomName;
 
 // Re-resolves the current ROM whenever the controller list changes (same GetControllers /
 // "pinmame::<rom>" gameId convention every other plugin here uses to find PinMAME, e.g.
-// AltSoundPlugin.cpp's OnControllersChanged) and reloads that ROM's score fields -- so
+// AltSoundPlugin.cpp's OnControllersChanged) and reloads that ROM's byte layout -- so
 // switching tables (or a fresh launch with no ROM loaded yet) doesn't keep forwarding a
-// stale, wrong previous table's score layout.
+// stale, wrong previous table's score layout, or worse, decide a game started because the
+// previous ROM's game_over byte happens to sit somewhere meaningful in this one.
 static void OnControllersChanged(const unsigned int eventId, void* userData, void* msgData)
 {
    std::string romName;
@@ -881,7 +1037,7 @@ static void OnControllersChanged(const unsigned int eventId, void* userData, voi
       return;
    currentRomName = romName;
    if (scorePoller)
-      scorePoller->SetFields(romName.empty() ? std::vector<ScoreField>() : LoadScoreFields(romName));
+      scorePoller->SetMap(romName.empty() ? RomMap() : LoadRomMap(romName));
 }
 
 }
