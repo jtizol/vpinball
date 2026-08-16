@@ -118,6 +118,14 @@ static std::atomic<uint64_t> startPressedAtMs { 0 };
 static std::atomic<bool> overrideRequested { false };
 // A Start press that the veto swallowed, waiting to be reported from the poller thread.
 static std::atomic<bool> startSwallowed { false };
+// True only while we are synthesizing a press ourselves. MUST exist: SetInputState goes through
+// InputAction::SetDirectState -> OnInputChanged -> OnInputActionStateChanged, which is the very
+// callback the veto lives in -- without this the plugin would swallow its own remote start and
+// the phone button would do nothing, in a way that looks exactly like the lock working.
+static std::atomic<bool> synthesizing { false };
+// The VPX API. Needed only to press buttons; every other path in this plugin talks to the
+// message bus instead.
+static const VPXPluginAPI* vpxApi = nullptr;
 // What the plugin last TOLD the bus about itself. Announcements are driven by the EFFECTIVE
 // veto (StartIsVetoed), sampled on the poller thread -- never by what the server said. Those
 // two differ in exactly the cases that matter: a dashboard that went quiet, or a lock that
@@ -147,6 +155,31 @@ static void SetLockFromServer(bool locked, uint64_t ceilingMs)
 }
 
 /**
+ * Press and release one action, as if the cabinet's own button had been pushed.
+ *
+ * THIS IS HOW THE PHONE STARTS A GAME. The queued player taps "Start my game" and the cabinet
+ * stays locked the whole time -- the physical button never opens, so the kid standing at the
+ * machine cannot beat them to it. The only way in is the app.
+ *
+ * Runs on the poller thread, never the input thread. The 80ms hold is a real button press's
+ * worth: PinMAME samples switches on its own clock, and a press released within a single frame
+ * can be missed entirely.
+ */
+static void PressAction(VPXAction action, int holdMs)
+{
+   if (!vpxApi || !vpxApi->SetInputState)
+      return;
+   const uint64_t bit = 1ULL << static_cast<int>(action);
+   synthesizing.store(true);
+   VPXInputState down {}; down.actionMask = bit; down.actionState = bit;
+   vpxApi->SetInputState(&down);
+   std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+   VPXInputState up {}; up.actionMask = bit; up.actionState = 0;
+   vpxApi->SetInputState(&up);
+   synthesizing.store(false);
+}
+
+/**
  * Should a Start press be swallowed right now?
  *
  * RUNS ON THE INPUT THREAD. Atomics only -- no allocation, no lock, and above all no network.
@@ -154,6 +187,8 @@ static void SetLockFromServer(bool locked, uint64_t ceilingMs)
  */
 static bool StartIsVetoed()
 {
+   if (synthesizing.load())
+      return false; // our own press -- see `synthesizing`
    if (!lockFlag.load())
       return false;
    const uint64_t t = NowMs();
@@ -1045,6 +1080,23 @@ private:
          const nlohmann::json parsed = nlohmann::json::parse(body);
          if (parsed.contains("locked") && parsed["locked"].is_boolean())
             SetLockFromServer(parsed["locked"].get<bool>(), parsed.value("lockMaxMs", (uint64_t)0));
+         // The remote start. One-shot: the server clears it the moment it hands it over, so a
+         // poll that arrives twice cannot start two games.
+         if (parsed.value("startNow", false)) {
+            // A credit first, when the ROM needs one -- the server knows from NVRAM whether
+            // this table is on free play and how many credits are banked, so we press it only
+            // when a real player would have had to. Without this, "Start my game" silently
+            // does nothing on a credit-mode table, which is precisely what a Start press does
+            // when it is vetoed: two very different faults that look identical.
+            if (parsed.value("addCredit", false)) {
+               PressAction(VPXACTION_AddCredit, 80);
+               std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+            PressAction(VPXACTION_StartGame, 80);
+            HttpSender::PostJson("/api/emit",
+               "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start pressed from the app\","
+               "\"detail\":\"the queued player took their turn from their phone\"}");
+         }
       } catch (...) { }
    }
 
@@ -1263,6 +1315,13 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    // subscriber leaves in the event -- see OnActionChanged and the Start lock section above.
    onActionChangedId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_EVT_ON_ACTION_CHANGED);
    msgApi->SubscribeMsg(endpointId, onActionChangedId, OnActionChanged, nullptr);
+
+   // The VPX API, used only to PRESS buttons -- the phone's "Start my game" is delivered as a
+   // real Start action so the cabinet never has to unlock for it. Same GetAPI handshake every
+   // other plugin here uses (see DOFPlugin).
+   unsigned int getVpxApiId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_MSG_GET_API);
+   msgApi->BroadcastMsg(endpointId, getVpxApiId, &vpxApi);
+   msgApi->ReleaseMsgID(getVpxApiId);
 
    // Passive tap on the audio broadcast PinMAME/PUP/AltSound already send -- see AudioMeter.
    audioMeter = std::make_unique<AudioMeter>();
