@@ -80,6 +80,90 @@ static const char* TypeName(char c)
 
 struct QueuedEvent { char type; int id; int value; };
 
+///////////////////////////////////////////////////////////////////////////////
+//
+// The Start lock -- the cabinet's turn queue, enforced.
+//
+// WHAT IT IS. When somebody is waiting for a turn and the current game ends, the dashboard
+// locks the cabinet and offers the turn to whoever is next. Until they answer, pressing the
+// physical Start button must do nothing. That is enforced HERE, because it cannot be enforced
+// anywhere else: an overlay window can't stop a key press, and quitting the table is
+// destructive. VPX broadcasts every input action to plugins with a mutable event
+// (VPXPI_EVT_ON_ACTION_CHANGED / InputManager::OnInputActionStateChanged) and honours a plugin
+// zeroing enableVPXProcessing -- upstream API, not a patch to our fork.
+//
+// HOW IT GETS HERE. It rides home on the reply to the /api/emit POST this plugin already makes
+// constantly during play. No new socket, no new thread, no polling.
+//
+// IT FAILS OPEN, THREE WAYS, AND THAT IS THE WHOLE DESIGN. A stuck lock turns a pinball machine
+// into furniture in a house where most of the players are under ten and can't debug it. So:
+//   1. the dashboard goes quiet for LOCK_STALE_MS  -> unlocked (server died, wifi died, restart)
+//   2. a lock stands longer than the server's own ceiling -> unlocked
+//   3. somebody holds Start for OVERRIDE_HOLD_MS -> unlocked here AND at the dashboard
+// Any one of them is enough on its own. None of them depends on the dashboard being reachable
+// except the one that only matters when it is.
+//
+// See docs/decisions/table-sessions-and-queue.md in the pinball_cab repo.
+
+/** No word from the dashboard in this long and the lock is abandoned. */
+static const uint64_t LOCK_STALE_MS = 5000;
+/** Hold Start this long, then release, to force the cabinet open. */
+static const uint64_t OVERRIDE_HOLD_MS = 3000;
+
+static std::atomic<bool> lockFlag { false };
+static std::atomic<uint64_t> lockSeenAtMs { 0 };   // last time the dashboard told us anything
+static std::atomic<uint64_t> lockSinceMs { 0 };    // when this lock first went up
+static std::atomic<uint64_t> lockCeilingMs { 180000 }; // the server's own MAX_LOCK_MS
+static std::atomic<uint64_t> startPressedAtMs { 0 };
+static std::atomic<bool> overrideRequested { false };
+// What the plugin last TOLD the bus about itself. Announcements are driven by the EFFECTIVE
+// veto (StartIsVetoed), sampled on the poller thread -- never by what the server said. Those
+// two differ in exactly the cases that matter: a dashboard that went quiet, or a lock that
+// outlived its ceiling, both leave the server saying "locked" while the Start button works
+// perfectly. Only the effective state explains a Start press that did nothing, which is the
+// entire question anyone will be asking when they read this line back.
+static bool announcedVeto = false;
+
+static uint64_t NowMs()
+{
+   return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/** Called from the HTTP thread with whatever the dashboard just said. */
+static void SetLockFromServer(bool locked, uint64_t ceilingMs)
+{
+   const uint64_t t = NowMs();
+   lockSeenAtMs.store(t);
+   if (ceilingMs > 0)
+      lockCeilingMs.store(ceilingMs);
+   const bool was = lockFlag.exchange(locked);
+   if (locked && !was)
+      lockSinceMs.store(t);
+   else if (!locked)
+      lockSinceMs.store(0);
+}
+
+/**
+ * Should a Start press be swallowed right now?
+ *
+ * RUNS ON THE INPUT THREAD. Atomics only -- no allocation, no lock, and above all no network.
+ * A blocking call here would stall input for every player, including the one whose turn it is.
+ */
+static bool StartIsVetoed()
+{
+   if (!lockFlag.load())
+      return false;
+   const uint64_t t = NowMs();
+   const uint64_t seen = lockSeenAtMs.load();
+   if (seen == 0 || t - seen > LOCK_STALE_MS)
+      return false; // fail open #1: nobody is home at the dashboard
+   const uint64_t since = lockSinceMs.load();
+   if (since != 0 && t - since > lockCeilingMs.load())
+      return false; // fail open #2: this lock has outstayed the server's own ceiling
+   return true;
+}
+
 // Batches events over a short window before sending one HTTP POST per batch, rather than one
 // POST per individual event: GI fades and multiplexed solenoid drive can fire many state
 // changes within a single frame, and POSTing synchronously per-event on this thread would
@@ -177,8 +261,19 @@ private:
          json += "\"}";
       }
       json += "]";
-      if (!first) // at least one event actually got written
-         PostJson("/api/emit", json);
+      if (first)
+         return; // nothing actually got written
+      // The reply carries {locked, lockMaxMs}. Parsed leniently: a dashboard too old to send
+      // them, or any malformed reply, must leave the lock untouched rather than latch it on --
+      // the failure that matters here is a cabinet stuck locked, never one stuck unlocked.
+      const std::string reply = PostJson("/api/emit", json);
+      if (reply.empty())
+         return;
+      try {
+         const nlohmann::json parsed = nlohmann::json::parse(reply);
+         if (parsed.contains("locked") && parsed["locked"].is_boolean())
+            SetLockFromServer(parsed["locked"].get<bool>(), parsed.value("lockMaxMs", (uint64_t)0));
+      } catch (...) { /* a bad reply is not a reason to change the lock */ }
    }
 
    // A minimal, blocking HTTP/1.1 POST over a raw TCP socket to 127.0.0.1:7333 -- no TLS, no
@@ -225,23 +320,35 @@ public:
 #else
       close(sock);
 #endif
+      return ExtractJsonBody(resp);
+   }
+
+   // Node sends these small responses CHUNKED, so the raw body is "3b\r\n{...}\r\n0\r\n\r\n" and
+   // feeding it straight to a JSON parser throws on the chunk-size line. Rather than implement
+   // de-chunking, take the outermost JSON object. Verified against the real server: without
+   // this the gain poller silently caught, continued, and the whole live-control path did
+   // nothing while looking perfectly healthy.
+   //
+   // Shared by GetBody and PostJson since the lock state started riding home on the POST
+   // response -- one de-chunker, not two that can drift apart.
+   static std::string ExtractJsonBody(const std::string& resp)
+   {
       const size_t sep = resp.find("\r\n\r\n");
       if (sep == std::string::npos)
          return std::string();
       const std::string body = resp.substr(sep + 4);
-      // Node sends these small responses CHUNKED, so the raw body is "3b\r\n{...}\r\n0\r\n\r\n"
-      // and feeding it straight to a JSON parser throws on the chunk-size line. Rather than
-      // implement de-chunking for one tiny endpoint, take the outermost JSON object. Verified
-      // against the real server: without this the poller silently caught, continued, and the
-      // whole live-control path did nothing while looking perfectly healthy.
       const size_t open = body.find('{'), close = body.rfind('}');
       if (open == std::string::npos || close == std::string::npos || close < open)
          return std::string();
       return body.substr(open, close - open + 1);
    }
 
-   static void PostJson(const char* path, const std::string& json)
+   // Returns the response body (see ExtractJsonBody), or "" on any failure. Callers that don't
+   // care simply ignore it -- but /api/emit's reply carries the Start lock, which is how the
+   // veto reaches this plugin without a second socket or a poll of its own.
+   static std::string PostJson(const char* path, const std::string& json)
    {
+      std::string resp;
 #ifdef _WIN32
       static bool wsaInit = false;
       if (!wsaInit) {
@@ -251,14 +358,14 @@ public:
       }
       SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
       if (sock == INVALID_SOCKET)
-         return;
+         return resp;
       DWORD timeoutMs = 200;
       setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
       setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
 #else
       int sock = socket(AF_INET, SOCK_STREAM, 0);
       if (sock < 0)
-         return;
+         return resp;
       struct timeval timeout { 0, 200000 }; // 200ms
       setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
       setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
@@ -275,15 +382,18 @@ public:
             "Content-Type: application/json\r\n"
             "Content-Length: " + std::to_string(json.size()) + "\r\n"
             "Connection: close\r\n\r\n" + json;
+         // Read the WHOLE response rather than one 256-byte recv. It used to be drained and
+         // discarded purely so the connection closed cleanly; now the body is the transport for
+         // the Start lock, and a single recv can return a partial read on any TCP boundary.
 #ifdef _WIN32
          send(sock, req.c_str(), (int)req.size(), 0);
-         char buf[256];
-         recv(sock, buf, sizeof(buf), 0); // drain the response so the connection closes cleanly
 #else
          send(sock, req.c_str(), req.size(), 0);
-         char buf[256];
-         recv(sock, buf, sizeof(buf), 0);
 #endif
+         char buf[1024];
+         int n;
+         while ((n = (int)recv(sock, buf, sizeof(buf), 0)) > 0)
+            resp.append(buf, n);
       }
 
 #ifdef _WIN32
@@ -291,6 +401,7 @@ public:
 #else
       close(sock);
 #endif
+      return ExtractJsonBody(resp);
    }
 
 private:
@@ -897,8 +1008,43 @@ public:
    }
 
 private:
+   // The lock's safety net, and the override's outbound leg. Both live on this thread because
+   // it is the one thing in the plugin that ticks regardless of anything else -- it does not
+   // depend on events flowing, which matters: VPX pauses itself when the playfield loses focus
+   // and the whole event stream stops with it. Without this, a lock would go stale during a
+   // pause and fail open just as the player refocused and reached for Start.
+   void PollLock(int tick)
+   {
+      if (overrideRequested.exchange(false)) {
+         HttpSender::PostJson("/api/table/override", "{}");
+         HttpSender::PostJson("/api/emit",
+            "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start held -- cabinet forced open\","
+            "\"detail\":\"override from the machine itself\"}");
+      }
+      // Sampled every tick (~200ms), not just when the server speaks -- a fail-open is a
+      // transition nobody sent us, and it is the one most worth seeing on the bus.
+      const bool veto = StartIsVetoed();
+      if (veto != announcedVeto) {
+         announcedVeto = veto;
+         HttpSender::PostJson("/api/emit", veto
+            ? "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start locked\",\"detail\":\"the plugin is now vetoing the Start button\"}"
+            : "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start unlocked\",\"detail\":\"the Start button works again\"}");
+      }
+      if (tick % 5 != 0) // ~1s; the batch replies already carry it whenever play is happening
+         return;
+      const std::string body = HttpSender::GetBody("/api/table/lock");
+      if (body.empty())
+         return; // dashboard unreachable: leave it to LOCK_STALE_MS, which fails open
+      try {
+         const nlohmann::json parsed = nlohmann::json::parse(body);
+         if (parsed.contains("locked") && parsed["locked"].is_boolean())
+            SetLockFromServer(parsed["locked"].get<bool>(), parsed.value("lockMaxMs", (uint64_t)0));
+      } catch (...) { }
+   }
+
    void Run()
    {
+      int tick = 0;
       while (true) {
          RomMap romMap;
          {
@@ -908,6 +1054,9 @@ private:
                return;
             romMap = m_map;
          }
+         // BEFORE the romMap check, deliberately: the lock has nothing to do with whether this
+         // ROM has a memory map, and a table we can't read scores for must still honour a turn.
+         PollLock(tick++);
          if (romMap.empty())
             continue;
          const std::vector<ScoreField>& fields = romMap.scores;
@@ -1006,6 +1155,7 @@ private:
 
 static std::unique_ptr<ScorePoller> scorePoller;
 static unsigned int onControllersChangedId = 0;
+static unsigned int onActionChangedId = 0;
 static unsigned int getControllersId = 0;
 static std::string currentRomName;
 
@@ -1015,6 +1165,42 @@ static std::string currentRomName;
 // switching tables (or a fresh launch with no ROM loaded yet) doesn't keep forwarding a
 // stale, wrong previous table's score layout, or worse, decide a game started because the
 // previous ROM's game_over byte happens to sit somewhere meaningful in this one.
+// The veto itself. VPX broadcasts this for every action state change and uses what we leave in
+// the struct (InputManager::OnInputActionStateChanged returns event.enableVPXProcessing != 0).
+//
+// ONLY VPXACTION_StartGame IS VETOED. Blocking AddCredit too was considered and dropped: adding
+// a credit doesn't begin a game, so blocking it buys no fairness and makes a coin-up during
+// someone else's handoff silently fail, which reads as a broken machine rather than a queue.
+//
+// KEEP THIS FUNCTION CHEAP. It is on the input path for every flipper press.
+static void OnActionChanged(const unsigned int eventId, void* userData, void* msgData)
+{
+   VPXActionEvent* const ev = static_cast<VPXActionEvent*>(msgData);
+   if (!ev || ev->action != VPXACTION_StartGame)
+      return;
+
+   // Hold-to-override, measured on the RELEASE: there is no "still held" event to watch, only
+   // state changes, so the press timestamp is stashed and the duration checked when it comes
+   // back up. Tracked before the veto returns, deliberately -- the escape hatch has to work
+   // while the button is doing nothing, which is exactly when somebody reaches for it.
+   if (ev->isPressed) {
+      startPressedAtMs.store(NowMs());
+   }
+   else {
+      const uint64_t pressedAt = startPressedAtMs.exchange(0);
+      if (pressedAt != 0 && NowMs() - pressedAt >= OVERRIDE_HOLD_MS) {
+         lockFlag.store(false); // locally, instantly -- do not wait for a round trip
+         lockSinceMs.store(0);
+         overrideRequested.store(true); // and tell the dashboard, off this thread
+      }
+   }
+
+   if (!StartIsVetoed())
+      return;
+   ev->isPressed = 0;
+   ev->enableVPXProcessing = 0;
+}
+
 static void OnControllersChanged(const unsigned int eventId, void* userData, void* msgData)
 {
    std::string romName;
@@ -1060,6 +1246,11 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    getControllersId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_CONTROLLERS_GET_MSG);
    msgApi->SubscribeMsg(endpointId, onControllersChangedId, OnControllersChanged, nullptr);
 
+   // The Start veto. VPX broadcasts this for every action state change and honours what a
+   // subscriber leaves in the event -- see OnActionChanged and the Start lock section above.
+   onActionChangedId = msgApi->GetMsgID(VPXPI_NAMESPACE, VPXPI_EVT_ON_ACTION_CHANGED);
+   msgApi->SubscribeMsg(endpointId, onActionChangedId, OnActionChanged, nullptr);
+
    // Passive tap on the audio broadcast PinMAME/PUP/AltSound already send -- see AudioMeter.
    audioMeter = std::make_unique<AudioMeter>();
    onAudioUpdateId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_UPDATE_MSG);
@@ -1082,6 +1273,8 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
    if (msgApi && onControllersChangedId) {
       msgApi->UnsubscribeMsg(onControllersChangedId, OnControllersChanged, nullptr);
       msgApi->ReleaseMsgID(onControllersChangedId);
+      msgApi->UnsubscribeMsg(onActionChangedId, OnActionChanged, nullptr);
+      msgApi->ReleaseMsgID(onActionChangedId);
       msgApi->ReleaseMsgID(getControllersId);
    }
    if (msgApi && onAudioUpdateId) {
