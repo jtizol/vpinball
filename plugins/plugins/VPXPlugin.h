@@ -189,15 +189,15 @@ typedef struct VPXTableInfo
 typedef struct VPXViewSetupDef
 {
    // See ViewSetup class for member description
-   int viewMode;                                       // [R_]
-   float sceneScaleX, sceneScaleY, sceneScaleZ;        // [R_]
+   int viewMode;                                       // [R_] Legacy/Camera/Window swaps the whole projection
+   float sceneScaleX, sceneScaleY, sceneScaleZ;        // [RW]
    float viewX, viewY, viewZ;                          // [RW]
-   float lookAt;                                       // [R_]
-   float viewportRotation;                             // [R_]
-   float FOV;                                          // [R_]
-   float layback;                                      // [R_]
-   float viewHOfs, viewVOfs;                           // [R_]
-   float windowTopZOfs, windowBottomZOfs;              // [R_]
+   float lookAt;                                       // [RW] 0..1, NOT the 0..100 the UI and ini show
+   float viewportRotation;                             // [RW] degrees
+   float FOV;                                          // [RW] degrees
+   float layback;                                      // [RW]
+   float viewHOfs, viewVOfs;                           // [RW]
+   float windowTopZOfs, windowBottomZOfs;              // [R_] would desync the real-to-virtual scale
    // Following fields are defined in user settings
    float screenWidth, screenHeight, screenInclination; // [R_]
    float realToVirtualScale;                           // [R_]

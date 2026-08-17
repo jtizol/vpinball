@@ -91,6 +91,24 @@ void MSGPIAPI VPXPluginAPIImpl::GetActiveViewSetup(VPXViewSetupDef* view)
    view->realToVirtualScale = viewSetup.GetRealToVirtualScale(g_pplayer->m_ptable);
 }
 
+// Applies the whole framing half of the view setup, not just the camera position. It used to
+// write viewX/Y/Z only, which made the plugin API able to MOVE the eye but not to zoom, lay the
+// table back, or re-aim it -- so a plugin could not reproduce what the in-game Point of View
+// page does, even though the struct already carried every one of those fields (they were simply
+// marked [R_] and dropped on the floor here).
+//
+// The writable set is deliberately the fields that only affect framing:
+//   - viewMode stays read-only: Legacy/Camera/Window swap the projection wholesale, and the
+//     in-game UI rebuilds its entire page around that change.
+//   - windowTopZOfs/windowBottomZOfs stay read-only: they alter the real-to-virtual scale, and
+//     the in-game UI follows them with SetViewPosFromPlayerPosition() using player-position
+//     state this API has no access to. Writing them alone would leave the two inconsistent.
+//
+// The refresh is what PointOfViewSettingsPage::OnPointOfViewChanged does, minus the static
+// prepass. Disabling the prepass is left to the caller (DisableStaticPrerendering, already
+// exposed) BECAUSE IT IS NOT FREE: the prepass caches lighting for a fixed camera, so turning it
+// off for a whole session to serve a few seconds of tuning is a real frame-rate cost -- which is
+// the caller's call to make and un-make, not ours to force permanently.
 void MSGPIAPI VPXPluginAPIImpl::SetActiveViewSetup(VPXViewSetupDef* view)
 {
    assert(g_pplayer); // Only allowed in game
@@ -98,6 +116,15 @@ void MSGPIAPI VPXPluginAPIImpl::SetActiveViewSetup(VPXViewSetupDef* view)
    viewSetup.mViewX = view->viewX;
    viewSetup.mViewY = view->viewY;
    viewSetup.mViewZ = view->viewZ;
+   viewSetup.mFOV = view->FOV;
+   viewSetup.mLayback = view->layback;
+   viewSetup.mLookAt = view->lookAt;
+   viewSetup.mViewportRotation = view->viewportRotation;
+   viewSetup.mViewHOfs = view->viewHOfs;
+   viewSetup.mViewVOfs = view->viewVOfs;
+   viewSetup.mSceneScaleX = view->sceneScaleX;
+   viewSetup.mSceneScaleY = view->sceneScaleY;
+   viewSetup.mSceneScaleZ = view->sceneScaleZ;
    g_pplayer->m_renderer->InitLayout();
 }
 

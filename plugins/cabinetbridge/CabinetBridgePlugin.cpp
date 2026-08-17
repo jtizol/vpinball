@@ -755,6 +755,138 @@ private:
 
 static std::unique_ptr<GainPoller> gainPoller;
 
+// ── Live table view ──────────────────────────────────────────────────────────────────────────
+// The same declarative shape as GainPoller above, for the same reasons (see its header): poll
+// the DESIRED view from the dashboard, push only what differs, self-heal on a dropped tick.
+//
+// WHY IT EXISTS. A table's camera is baked into the .vpx by its author for the screen THEY had,
+// and on this cabinet's portrait playfield window some tables need overriding. Doing that
+// through table.ini means a relaunch per attempt -- roughly a minute to judge a value you can
+// only judge by looking. This makes the same four numbers live.
+//
+// STATIC PREPASS. Changing the view invalidates the prepass's cached lighting, so it has to be
+// off while tuning -- but leaving it off costs frame rate for the rest of the session, which on
+// a fanless machine is exactly the budget we spent elsewhere getting the ball smooth. So it is
+// disabled on the FIRST change and restored when the dashboard reports tuning has stopped,
+// rather than being disabled for good the moment this plugin loads.
+static std::mutex viewPollerMutex;
+static std::unique_ptr<VPXViewSetupDef> viewPollerPending;
+static bool viewPollerPrepassOff = false;
+
+class ViewPoller
+{
+public:
+   ViewPoller() { m_thread = std::thread(&ViewPoller::Run, this); }
+   ~ViewPoller()
+   {
+      { std::lock_guard<std::mutex> lock(m_mutex); m_stopRequested = true; }
+      m_cv.notify_one();
+      if (m_thread.joinable())
+         m_thread.join();
+   }
+   ViewPoller(const ViewPoller&) = delete;
+   ViewPoller& operator=(const ViewPoller&) = delete;
+
+   // Runs on the MAIN thread, via RunOnMainThread -- the plugin API is not thread safe, and
+   // GetActiveViewSetup/SetActiveViewSetup both assert they are in game.
+   static void ApplyPending(void* /*userData*/)
+   {
+      if (!vpxApi || !vpxApi->GetActiveViewSetup || !vpxApi->SetActiveViewSetup)
+         return;
+      std::unique_ptr<VPXViewSetupDef> want;
+      {
+         std::lock_guard<std::mutex> lock(viewPollerMutex);
+         want.swap(viewPollerPending);
+      }
+      if (!want)
+         return;
+      // Read-modify-write, never write the struct wholesale: the dashboard only knows about the
+      // four framing fields, and everything else in here (scene scale, window Z offsets, the
+      // screen geometry) belongs to the table and the cabinet. Building a fresh struct would
+      // quietly reset all of it to whatever this plugin happened to leave zeroed.
+      VPXViewSetupDef view;
+      vpxApi->GetActiveViewSetup(&view);
+      view.FOV = want->FOV;
+      view.layback = want->layback;
+      view.lookAt = want->lookAt;
+      view.viewVOfs = want->viewVOfs;
+      vpxApi->SetActiveViewSetup(&view);
+   }
+
+   static void SetPrepass(void* userData)
+   {
+      if (vpxApi && vpxApi->DisableStaticPrerendering)
+         vpxApi->DisableStaticPrerendering(userData != nullptr);
+   }
+
+private:
+   void Run()
+   {
+      while (true) {
+         {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, std::chrono::milliseconds(200), [this] { return m_stopRequested; });
+            if (m_stopRequested)
+               return;
+         }
+         const std::string body = HttpSender::GetBody("/api/table-view-live");
+         if (body.empty())
+            continue;
+         try {
+            const auto j = nlohmann::json::parse(body);
+            if (!j.is_object())
+               continue;
+            const bool tuning = j.value("tuning", false);
+            if (tuning != m_tuning) {
+               m_tuning = tuning;
+               if (msgApi)
+                  msgApi->RunOnMainThread(endpointId, 0.0, ViewPoller::SetPrepass, tuning ? this : nullptr);
+               // Leaving tuning means the dashboard has stopped driving the view. Forget what we
+               // applied so that re-entering re-pushes it: the table may have been relaunched,
+               // or VPX's own POV page may have moved the view underneath us in between.
+               if (!tuning) { m_have = false; continue; }
+            }
+            if (!tuning)
+               continue;
+            VPXViewSetupDef want {};
+            want.FOV = j.value("FOV", 0.f);
+            want.layback = j.value("layback", 0.f);
+            // The engine keeps lookAt as 0..1 while every UI and ini shows 0..100 (ViewSetup.h).
+            // Converting here rather than in the dashboard keeps that unit quirk next to the API
+            // that has it, instead of leaking a /100 into a settings form.
+            want.lookAt = j.value("lookAt", 25.f) * 0.01f;
+            want.viewVOfs = j.value("vOfs", 0.f);
+            if (m_have && std::abs(m_applied.FOV - want.FOV) < 0.001f
+                       && std::abs(m_applied.layback - want.layback) < 0.001f
+                       && std::abs(m_applied.lookAt - want.lookAt) < 0.00001f
+                       && std::abs(m_applied.viewVOfs - want.viewVOfs) < 0.001f)
+               continue;   // unchanged -- never fight VPX's own POV page 5x a second
+            m_applied = want;
+            m_have = true;
+            {
+               std::lock_guard<std::mutex> lock(viewPollerMutex);
+               viewPollerPending = std::make_unique<VPXViewSetupDef>(want);
+            }
+            if (msgApi)
+               msgApi->RunOnMainThread(endpointId, 0.0, ViewPoller::ApplyPending, nullptr);
+         }
+         catch (...) {
+            continue; // dashboard restarting, or a partial read -- next tick retries
+         }
+      }
+   }
+
+   VPXViewSetupDef m_applied {};
+   bool m_have = false;
+   bool m_tuning = false;
+   std::mutex m_mutex;
+   std::condition_variable m_cv;
+   bool m_stopRequested = false;
+   std::thread m_thread;
+};
+
+static std::unique_ptr<ViewPoller> viewPoller;
+
 static void OnAudioUpdate(const unsigned int eventId, void* userData, void* msgData)
 {
    if (audioMeter && msgData)
@@ -1338,6 +1470,7 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    // Inbound: dashboard fader -> running table's mixer. Started after the ids above exist,
    // because ApplyPending needs getAudioSrcId to resolve names to sources.
    gainPoller = std::make_unique<GainPoller>();
+   viewPoller = std::make_unique<ViewPoller>();
 }
 
 MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
@@ -1361,6 +1494,7 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
    // Stop submitting runnables, THEN flush the ones already queued -- MsgPlugin.h requires that
    // order on unload, or a marshalled ApplyPending could run after its plugin state is gone.
    gainPoller = nullptr;
+   viewPoller = nullptr;
    if (msgApi)
       msgApi->FlushPendingCallbacks(endpointId);
    {
