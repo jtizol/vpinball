@@ -843,7 +843,11 @@ public:
       j["mode"] = view.viewMode;
       j["FOV"] = view.FOV;
       j["layback"] = view.layback;
-      j["lookAt"] = view.lookAt * 100.f;   // engine keeps 0..1, every UI shows 0..100
+      // RAW, no conversion. An earlier x100 here was guesswork from ViewSetup.h's `mLookAt =
+      // 0.25f` initialiser, and it was wrong: getFloat() applies no scaling on load and Camera
+      // mode uses `mLookAt / 100.0f`, so the field is already the same 0..100 the ini and every
+      // UI use. The conversion made the tuner show a number 100x off and save it that way.
+      j["lookAt"] = view.lookAt;
       j["vOfs"] = view.viewVOfs;
       HttpSender::PostJson("/api/table-view-live", j.dump());
    }
@@ -888,10 +892,7 @@ private:
             VPXViewSetupDef want {};
             want.FOV = j.value("FOV", 0.f);
             want.layback = j.value("layback", 0.f);
-            // The engine keeps lookAt as 0..1 while every UI and ini shows 0..100 (ViewSetup.h).
-            // Converting here rather than in the dashboard keeps that unit quirk next to the API
-            // that has it, instead of leaking a /100 into a settings form.
-            want.lookAt = j.value("lookAt", 25.f) * 0.01f;
+            want.lookAt = j.value("lookAt", 25.f);   // 0..100, same as the ini -- see SendSeed
             want.viewVOfs = j.value("vOfs", 0.f);
             if (m_have && std::abs(m_applied.FOV - want.FOV) < 0.001f
                        && std::abs(m_applied.layback - want.layback) < 0.001f
