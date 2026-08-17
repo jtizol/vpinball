@@ -819,6 +819,35 @@ public:
          vpxApi->DisableStaticPrerendering(userData != nullptr);
    }
 
+   // Read the table's ACTUAL current view and hand it to the dashboard, so the tuner opens
+   // showing where the table already is instead of snapping it to some default the moment it is
+   // switched on. Without this, turning tuning on visibly lurched the view -- the dashboard had
+   // no way to know a camera it has never been able to read.
+   //
+   // Runs on the main thread (GetActiveViewSetup asserts in-game and the API is not thread
+   // safe), and does its own POST from here: this is one call at the start of a tuning session,
+   // not a per-tick cost.
+   static void SendSeed(void* /*userData*/)
+   {
+      if (!vpxApi || !vpxApi->GetActiveViewSetup)
+         return;
+      VPXViewSetupDef view;
+      vpxApi->GetActiveViewSetup(&view);
+      nlohmann::json j;
+      j["seeded"] = true;
+      // The active view MODE, reported because it decides which controls are even meaningful:
+      // layback is applied only in Legacy (ViewSetup.cpp gates it on isLegacy in both the
+      // projection and the camera fit), and the H/V frustum offsets only in Camera/Window. A
+      // tuner that showed all of them regardless would offer sliders that silently do nothing.
+      // 0=Legacy, 1=Camera, 2=Window.
+      j["mode"] = view.viewMode;
+      j["FOV"] = view.FOV;
+      j["layback"] = view.layback;
+      j["lookAt"] = view.lookAt * 100.f;   // engine keeps 0..1, every UI shows 0..100
+      j["vOfs"] = view.viewVOfs;
+      HttpSender::PostJson("/api/table-view-live", j.dump());
+   }
+
 private:
    void Run()
    {
@@ -848,6 +877,14 @@ private:
             }
             if (!tuning)
                continue;
+            // Until the dashboard holds the table's real values there is nothing safe to apply:
+            // applying its placeholder defaults is exactly the lurch this handshake exists to
+            // prevent. Ask once, then wait for a poll that comes back seeded.
+            if (!j.value("seeded", false)) {
+               if (msgApi)
+                  msgApi->RunOnMainThread(endpointId, 0.0, ViewPoller::SendSeed, nullptr);
+               continue;
+            }
             VPXViewSetupDef want {};
             want.FOV = j.value("FOV", 0.f);
             want.layback = j.value("layback", 0.f);
