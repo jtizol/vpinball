@@ -810,6 +810,14 @@ public:
       view.layback = want->layback;
       view.lookAt = want->lookAt;
       view.viewVOfs = want->viewVOfs;
+      view.viewHOfs = want->viewHOfs;
+      view.viewX = want->viewX;
+      view.viewY = want->viewY;
+      view.viewZ = want->viewZ;
+      view.viewportRotation = want->viewportRotation;
+      view.sceneScaleX = want->sceneScaleX;
+      view.sceneScaleY = want->sceneScaleY;
+      view.sceneScaleZ = want->sceneScaleZ;
       vpxApi->SetActiveViewSetup(&view);
    }
 
@@ -849,6 +857,14 @@ public:
       // UI use. The conversion made the tuner show a number 100x off and save it that way.
       j["lookAt"] = view.lookAt;
       j["vOfs"] = view.viewVOfs;
+      j["hOfs"] = view.viewHOfs;
+      j["playerX"] = view.viewX;
+      j["playerY"] = view.viewY;
+      j["playerZ"] = view.viewZ;
+      j["rotation"] = view.viewportRotation;
+      j["scaleX"] = view.sceneScaleX;
+      j["scaleY"] = view.sceneScaleY;
+      j["scaleZ"] = view.sceneScaleZ;
       HttpSender::PostJson("/api/table-view-live", j.dump());
    }
 
@@ -894,10 +910,20 @@ private:
             want.layback = j.value("layback", 0.f);
             want.lookAt = j.value("lookAt", 25.f);   // 0..100, same as the ini -- see SendSeed
             want.viewVOfs = j.value("vOfs", 0.f);
-            if (m_have && std::abs(m_applied.FOV - want.FOV) < 0.001f
-                       && std::abs(m_applied.layback - want.layback) < 0.001f
-                       && std::abs(m_applied.lookAt - want.lookAt) < 0.00001f
-                       && std::abs(m_applied.viewVOfs - want.viewVOfs) < 0.001f)
+            // Every driven field, not a subset: a field left out of this comparison is one whose
+            // changes are silently swallowed once anything else has been applied.
+            const float d[] = { m_applied.FOV - want.FOV, m_applied.layback - want.layback,
+                                m_applied.lookAt - want.lookAt, m_applied.viewVOfs - want.viewVOfs,
+                                m_applied.viewHOfs - want.viewHOfs,
+                                m_applied.viewX - want.viewX, m_applied.viewY - want.viewY,
+                                m_applied.viewZ - want.viewZ,
+                                m_applied.viewportRotation - want.viewportRotation,
+                                m_applied.sceneScaleX - want.sceneScaleX,
+                                m_applied.sceneScaleY - want.sceneScaleY,
+                                m_applied.sceneScaleZ - want.sceneScaleZ };
+            bool same = true;
+            for (const float v : d) if (std::abs(v) >= 0.0001f) { same = false; break; }
+            if (m_have && same)
                continue;   // unchanged -- never fight VPX's own POV page 5x a second
             m_applied = want;
             m_have = true;
