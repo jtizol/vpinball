@@ -803,7 +803,7 @@ public:
       // Read-modify-write, never write the struct wholesale: the dashboard only knows about the
       // four framing fields, and everything else in here (scene scale, window Z offsets, the
       // screen geometry) belongs to the table and the cabinet. Building a fresh struct would
-      // quietly reset all of it to whatever this plugin happened to leave zeroed.
+      // quietly reset all of it to whatever this plugin happened to leave zeroed.   // TEMP
       VPXViewSetupDef view;
       vpxApi->GetActiveViewSetup(&view);
       view.FOV = want->FOV;
@@ -822,7 +822,7 @@ public:
    }
 
    static void SetPrepass(void* userData)
-   {
+   {   // TEMP
       if (vpxApi && vpxApi->DisableStaticPrerendering)
          vpxApi->DisableStaticPrerendering(userData != nullptr);
    }
@@ -910,6 +910,19 @@ private:
             want.layback = j.value("layback", 0.f);
             want.lookAt = j.value("lookAt", 25.f);   // 0..100, same as the ini -- see SendSeed
             want.viewVOfs = j.value("vOfs", 0.f);
+            want.viewHOfs = j.value("hOfs", 0.f);
+            want.viewX = j.value("playerX", 0.f);
+            want.viewY = j.value("playerY", 371.f);
+            want.viewZ = j.value("playerZ", 1297.f);
+            want.viewportRotation = j.value("rotation", 0.f);
+            // Scene scale has NO safe zero: `want` is zero-initialised, so a field parsed here
+            // but not assigned reaches the engine as 0 and collapses the whole scene to nothing.
+            // That is precisely what "the table goes black the moment I press Start tuning" was:
+            // an edit that silently failed to apply left these eight unparsed, and viewZ=0 plus
+            // sceneScale=0 went straight into the live view.
+            want.sceneScaleX = j.value("scaleX", 1.f);
+            want.sceneScaleY = j.value("scaleY", 1.f);
+            want.sceneScaleZ = j.value("scaleZ", 1.f);
             // Every driven field, not a subset: a field left out of this comparison is one whose
             // changes are silently swallowed once anything else has been applied.
             const float d[] = { m_applied.FOV - want.FOV, m_applied.layback - want.layback,
