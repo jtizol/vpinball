@@ -4,6 +4,7 @@
 #include "VPXPluginAPIImpl.h"
 
 #include "core/VPApp.h"
+#include "parts/ball.h"
 #include "parts/flasher.h"
 #include "renderer/Renderer.h"
 #include "ui/live/LiveUI.h"
@@ -38,6 +39,31 @@ void MSGPIAPI VPXPluginAPIImpl::GetTableInfo(VPXTableInfo* info)
    {
       memset(info, 0, sizeof(VPXTableInfo));
    }
+}
+
+int MSGPIAPI VPXPluginAPIImpl::GetActiveBalls(VPXBallInfo* balls, int maxCount)
+{
+   // Only valid in game -- same guard as GetTableInfo, for the same reason: this can be called
+   // from a plugin's own idle/poll loop, which can run before a table is loaded or after one
+   // has been torn down, not just mid-physics-tick.
+   if (g_pplayer == nullptr || maxCount <= 0)
+      return 0;
+
+   const int n = std::min((int)g_pplayer->m_vball.size(), maxCount);
+   for (int i = 0; i < n; i++)
+   {
+      const Ball* const ball = g_pplayer->m_vball[i];
+      const Vertex3Ds& pos = ball->GetPosition();
+      const Vertex3Ds& vel = ball->GetVelocity();
+      balls[i].x = pos.x;
+      balls[i].y = pos.y;
+      balls[i].z = pos.z;
+      balls[i].vx = vel.x;
+      balls[i].vy = vel.y;
+      balls[i].vz = vel.z;
+      balls[i].radius = ball->GetRadius();
+   }
+   return n;
 }
 
 
@@ -768,6 +794,7 @@ VPXPluginAPIImpl::VPXPluginAPIImpl(MsgPI::MsgPluginManager& pluginManager)
    // VPX API
    m_api.GetVpxInfo = GetVpxInfo;
    m_api.GetTableInfo = GetTableInfo;
+   m_api.GetActiveBalls = GetActiveBalls;
 
    m_api.PushNotification = PushNotification;
    m_api.UpdateNotification = UpdateNotification;

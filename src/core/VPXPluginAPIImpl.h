@@ -69,6 +69,7 @@ private:
 
    static void MSGPIAPI GetVpxInfo(VPXInfo* info);
    static void MSGPIAPI GetTableInfo(VPXTableInfo* info);
+   static int MSGPIAPI GetActiveBalls(VPXBallInfo* balls, int maxCount);
 
    static unsigned int MSGPIAPI PushNotification(const char* msg, const int lengthMs);
    static void MSGPIAPI UpdateNotification(const unsigned int handle, const char* msg, const int lengthMs);

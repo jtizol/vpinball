@@ -1325,6 +1325,39 @@ private:
       }
    }
 
+   // Live ball position, for rear-left/rear-right exciter zones -- see
+   // docs/decisions/ssf-exciter-build.md's "continuous texture (ball roll)" case, previously
+   // blocked on this data simply not being exposed across the plugin boundary (it always
+   // existed in-process, see VPXPluginAPIImpl::GetActiveBalls's own comment). Deliberately on
+   // THIS thread, not a new one: vpxApi's thread affinity is undocumented and only THIS thread
+   // is confirmed safe for calling into it (see remoteStartPending's comment above, learned the
+   // hard way from SetInputState) -- GetActiveBalls is a plain read rather than a mutation, but
+   // nothing here has verified it is safe from a different thread, so it isn't worth finding out.
+   // Same 200ms/5Hz cadence as everything else on this tick -- a texture effect doesn't need to
+   // resolve faster than a human can feel it, and this plugin has no idle/busy distinction to
+   // spend a tighter budget on yet.
+   //
+   // Deliberately POSTed to its own endpoint (/api/ball-positions), NOT /api/emit: this is the
+   // same "own channel, never the shared event bus" call audio-levels.js already made for a
+   // higher-frequency case (docs/decisions/audio-streams.md) -- a stream of positions is
+   // meaningless on the Event Bus view and would just be noise there, same reasoning.
+   void PollBalls()
+   {
+      if (!vpxApi || !vpxApi->GetActiveBalls || !vpxApi->GetTableInfo || !m_sender)
+         return;
+      VPXBallInfo balls[16]; // more balls than any real machine locks at once; extras are dropped, not crashed on
+      const int n = vpxApi->GetActiveBalls(balls, 16);
+      if (n <= 0)
+         return; // nothing in play -- no point posting an empty tick 5x/sec
+      VPXTableInfo table {};
+      vpxApi->GetTableInfo(&table);
+      nlohmann::json arr = nlohmann::json::array();
+      for (int i = 0; i < n; i++)
+         arr.push_back({ { "x", balls[i].x }, { "y", balls[i].y }, { "vx", balls[i].vx }, { "vy", balls[i].vy } });
+      nlohmann::json event = { { "balls", arr }, { "tableWidth", table.tableWidth }, { "tableHeight", table.tableHeight } };
+      HttpSender::PostJson("/api/ball-positions", event.dump());
+   }
+
    void Run()
    {
       int tick = 0;
@@ -1340,6 +1373,9 @@ private:
          // BEFORE the romMap check, deliberately: the lock has nothing to do with whether this
          // ROM has a memory map, and a table we can't read scores for must still honour a turn.
          PollLock(tick++);
+         // Also before the romMap check -- ball position comes from VPX's own physics, not the
+         // ROM's memory map, so a table with no known score layout still gets exciter data.
+         PollBalls();
          if (romMap.empty())
             continue;
          const std::vector<ScoreField>& fields = romMap.scores;

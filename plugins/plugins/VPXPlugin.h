@@ -186,6 +186,18 @@ typedef struct VPXTableInfo
    float tableWidth, tableHeight; // [R_]
 } VPXTableInfo;
 
+// Live ball state, table-space units (same coordinate system VPXTableInfo's tableWidth/
+// tableHeight describe: x in [0, tableWidth], y in [0, tableHeight]). Read-only snapshot at the
+// moment GetActiveBalls is called -- there is no per-ball identity guaranteed stable across
+// calls (a drained/destroyed ball's slot is simply gone next call), so a caller tracking a ball
+// over time must do so by proximity/velocity continuity, not by array index.
+typedef struct VPXBallInfo
+{
+   float x, y, z;      // [R_] position
+   float vx, vy, vz;   // [R_] velocity, table units/sec
+   float radius;       // [R_]
+} VPXBallInfo;
+
 typedef struct VPXViewSetupDef
 {
    // See ViewSetup class for member description
@@ -274,6 +286,16 @@ typedef struct VPXPluginAPI
 
    // Game state
    double(MSGPIAPI* GetGameTime)(); // Game time in seconds
+
+   // Fills `balls` (caller-owned, `maxCount` capacity) with every live ball's current position/
+   // velocity/radius, most recent physics tick. Returns the number actually written (never more
+   // than maxCount, even if more balls than that exist -- pass a comfortably large maxCount,
+   // there is no separate "how many balls are there" query). 0 if no table is running.
+   // Deliberately a POLLED snapshot, not an event: VPXPI_EVT_ON_UPDATE_PHYSICS fires every
+   // physics tick with no payload precisely so a plugin can call this only when it actually
+   // wants a sample, at whatever rate it needs -- broadcasting full ball state on every tick
+   // regardless of whether anyone wants it would cost real frame time for no reason.
+   int (MSGPIAPI *GetActiveBalls)(VPXBallInfo* balls, int maxCount);
 
    // Rendering
    
