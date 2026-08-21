@@ -256,6 +256,7 @@ private:
 
    std::mutex m_screenshotMutex; // Guards the screenshot state below, shared between the logic thread (CaptureScreenshot) and the render thread (request loop & BGFX screenShot callback)
    int m_screenshotFrameDelay = 0;
+   int m_screenshotRetries = 0; // bounds the timeout-retry loop below -- see its own comment for why this exists
    bool m_screenshotSuccess = true;
    vector<VPX::Window*> m_screenshotWindow;
    vector<std::filesystem::path> m_screenshotFilename;

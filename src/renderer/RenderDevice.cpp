@@ -192,6 +192,12 @@ void RenderDevice::tBGFXCallback::screenShot(
          fireCallback = true;
          callbackSuccess = m_rd.m_screenshotSuccess;
          callback = m_rd.m_screenshotCallback;
+         // m_screenshotWindow is what the render loop's own timeout-retry check above gates on --
+         // it was never cleared here even on a fully successful delivery, so every capture (not
+         // just a stuck one) would eventually satisfy that check again ~60 frames later and retry
+         // a request nobody asked for. Clear it in lockstep with the callback firing.
+         m_rd.m_screenshotWindow.clear();
+         m_rd.m_screenshotRetries = 0;
       }
    }
    // Fire outside the lock: the callback may take other locks (e.g. the capture mutex) or re-enter CaptureScreenshot
@@ -935,10 +941,36 @@ void RenderDevice::BGFXDesktopRenderLoop(const bgfx::Init& init)
                   bgfx::requestScreenShot(m_screenshotWindow[i]->GetBackBuffer()->GetCoreFrameBuffer(), m_screenshotFilename[i].string().c_str());
             else if (m_screenshotFrameDelay < -60)
             {
-               // Sadly BGFX will silently fails screenshot capture, so if after 60 frames we did not get it, we try again
-               PLOGE << "Screenshot capture timed out. Requesting it again";
-               for (size_t i = 0; i < m_screenshotWindow.size(); i++)
-                  bgfx::requestScreenShot(m_screenshotWindow[i]->GetBackBuffer()->GetCoreFrameBuffer(), m_screenshotFilename[i].string().c_str());
+               // Sadly BGFX will silently fails screenshot capture, so if after 60 frames we did not
+               // get it, we try again -- BUT bound this. Confirmed live (this cabinet's own debug
+               // screenshot tool, requesting a window mid-relaunch): if a window is torn down before
+               // BGFX's callback ever fires for it, m_screenshotWindow/m_screenshotFilename never get
+               // cleared (only the SUCCESSFUL-delivery path in screenShot() erases its entry), so
+               // without a reset here m_screenshotFrameDelay keeps counting further negative forever,
+               // satisfying "< -60" on EVERY subsequent frame for the rest of the session -- a
+               // permanent every-frame requestScreenShot()+PLOGE storm, observed to visibly stall
+               // rendering (a table's own attract-mode animation looked frozen; it was this loop
+               // spinning, not the table). Reset the countdown on each retry so it happens at most
+               // once per ~60 frames, and give up after a few tries rather than forever: fire the
+               // pending callback as a failure and clear the request so a stuck window can never again
+               // block every future screenshot ("already in progress", CaptureScreenshot's own guard).
+               m_screenshotRetries++;
+               if (m_screenshotRetries > 3)
+               {
+                  PLOGE << "Screenshot capture failed after " << m_screenshotRetries << " retries -- giving up";
+                  std::function<void(bool)> callback = m_screenshotCallback;
+                  m_screenshotWindow.clear();
+                  m_screenshotFilename.clear();
+                  m_screenshotRetries = 0;
+                  callback(false);
+               }
+               else
+               {
+                  PLOGE << "Screenshot capture timed out. Requesting it again";
+                  m_screenshotFrameDelay = 1;
+                  for (size_t i = 0; i < m_screenshotWindow.size(); i++)
+                     bgfx::requestScreenShot(m_screenshotWindow[i]->GetBackBuffer()->GetCoreFrameBuffer(), m_screenshotFilename[i].string().c_str());
+               }
             }
          }
       }
@@ -2039,6 +2071,7 @@ void RenderDevice::CaptureScreenshot(const vector<VPX::Window*>& wnd, const vect
          m_screenshotFilename = filename;
          m_screenshotCallback = callback;
          m_screenshotFrameDelay = frameDelay;
+         m_screenshotRetries = 0;
          return;
       }
    }
