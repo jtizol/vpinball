@@ -10,6 +10,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <vector>
 #include <chrono>
 #include <cstdio>
@@ -123,6 +124,14 @@ static std::atomic<bool> startSwallowed { false };
 // callback the veto lives in -- without this the plugin would swallow its own remote start and
 // the phone button would do nothing, in a way that looks exactly like the lock working.
 static std::atomic<bool> synthesizing { false };
+// The remote-start handoff from LockPoller (which only DETECTS the command, fast, over its own
+// thread) to ScorePoller's PollLock (which actually PRESSES it). Confirmed live: calling
+// vpxApi->SetInputState from LockPoller's own thread generated real switch events but the ROM
+// never started a game, while the identical call from ScorePoller's thread worked every time --
+// vpxApi appears to have thread affinity nothing in its header documents. Keep every
+// PressAction call on ScorePoller's thread until that's confirmed otherwise.
+static std::atomic<bool> remoteStartPending { false };
+static std::atomic<bool> remoteStartNeedsCredit { false };
 // The VPX API. Needed only to press buttons; every other path in this plugin talks to the
 // message bus instead.
 static const VPXPluginAPI* vpxApi = nullptr;
@@ -320,22 +329,31 @@ private:
 public:
    // Public + path-parameterised because the audio meter below posts to a DIFFERENT endpoint
    // (/api/audio-levels, not the event bus) over the same tiny localhost socket helper.
-   // Minimal HTTP/1.1 GET returning just the body, same raw-socket approach and 200ms timeouts
-   // as PostJson below -- the gain poller needs to READ from the dashboard, which every other
-   // path in this plugin never had to do.
-   static std::string GetBody(const char* path)
+   // Minimal HTTP/1.1 GET returning just the body, same raw-socket approach and configurable
+   // timeouts as PostJson below -- the gain poller needs to READ from the dashboard, which every
+   // other path in this plugin never had to do. `timeoutMs` defaults to the original 200ms; a
+   // long-poll caller (LockPoller) passes a much longer value so the socket doesn't time out
+   // while the server is deliberately holding the response open.
+   //
+   // `liveSocketOut`, when given, publishes this call's live fd for the DURATION of the blocking
+   // recv() below, so a caller stuck waiting out a long timeout can be woken early by another
+   // thread. Ownership of actually closing the fd never leaves this function -- the "waker" only
+   // ever shutdown()s it (which unblocks recv() without invalidating the fd number), and an
+   // atomic compare_exchange decides, race-free, whether this call or the waker "claims" the slot
+   // first; either way only THIS thread's close() below ever runs. See LockPoller's destructor.
+   static std::string GetBody(const char* path, int timeoutMs = 200, std::atomic<int>* liveSocketOut = nullptr)
    {
       std::string resp;
 #ifdef _WIN32
       SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
       if (sock == INVALID_SOCKET) return resp;
-      DWORD toMs = 200;
+      DWORD toMs = (DWORD)timeoutMs;
       setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&toMs, sizeof(toMs));
       setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&toMs, sizeof(toMs));
 #else
       int sock = socket(AF_INET, SOCK_STREAM, 0);
       if (sock < 0) return resp;
-      struct timeval to { 0, 200000 };
+      struct timeval to { timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
       setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
       setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
 #endif
@@ -344,6 +362,7 @@ public:
       addr.sin_port = htons(7333);
       inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
       if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
+         if (liveSocketOut) liveSocketOut->store((int)sock, std::memory_order_release);
          const std::string req = std::string("GET ") + path + " HTTP/1.1\r\n"
             "Host: localhost\r\nConnection: close\r\n\r\n";
          send(sock, req.c_str(), (int)req.size(), 0);
@@ -351,6 +370,10 @@ public:
          int n;
          while ((n = (int)recv(sock, buf, sizeof(buf), 0)) > 0)
             resp.append(buf, n);
+         if (liveSocketOut) {
+            int expected = (int)sock;
+            liveSocketOut->compare_exchange_strong(expected, -1); // no-op if the waker beat us to it
+         }
       }
 #ifdef _WIN32
       closesocket(sock);
@@ -1280,33 +1303,26 @@ private:
             ? "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start locked\",\"detail\":\"the plugin is now vetoing the Start button\"}"
             : "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start unlocked\",\"detail\":\"the Start button works again\"}");
       }
-      if (tick % 5 != 0) // ~1s; the batch replies already carry it whenever play is happening
-         return;
-      const std::string body = HttpSender::GetBody("/api/table/lock");
-      if (body.empty())
-         return; // dashboard unreachable: leave it to LOCK_STALE_MS, which fails open
-      try {
-         const nlohmann::json parsed = nlohmann::json::parse(body);
-         if (parsed.contains("locked") && parsed["locked"].is_boolean())
-            SetLockFromServer(parsed["locked"].get<bool>(), parsed.value("lockMaxMs", (uint64_t)0));
-         // The remote start. One-shot: the server clears it the moment it hands it over, so a
-         // poll that arrives twice cannot start two games.
-         if (parsed.value("startNow", false)) {
-            // A credit first, when the ROM needs one -- the server knows from NVRAM whether
-            // this table is on free play and how many credits are banked, so we press it only
-            // when a real player would have had to. Without this, "Start my game" silently
-            // does nothing on a credit-mode table, which is precisely what a Start press does
-            // when it is vetoed: two very different faults that look identical.
-            if (parsed.value("addCredit", false)) {
-               PressAction(VPXACTION_AddCredit, 80);
-               std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            }
-            PressAction(VPXACTION_StartGame, 80);
-            HttpSender::PostJson("/api/emit",
-               "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start pressed from the app\","
-               "\"detail\":\"the queued player took their turn from their phone\"}");
+      // The GET /api/table/lock check (SetLockFromServer + DETECTING the one-shot remote-start
+      // command) used to live here, gated to ~1s (tick % 5). It now lives on its own long-poll
+      // thread -- see LockPoller below -- so "Start my game" is DISCOVERED in tens of ms instead
+      // of whatever this 200ms tick's next multiple-of-5 happened to be. The actual PRESS still
+      // happens HERE, though: see remoteStartPending's comment for why.
+      if (remoteStartPending.exchange(false)) {
+         // A credit first, when the ROM needs one -- the server knows from NVRAM whether this
+         // table is on free play and how many credits are banked, so we press it only when a
+         // real player would have had to. Without this, "Start my game" silently does nothing
+         // on a credit-mode table, which is precisely what a Start press does when it is
+         // vetoed: two very different faults that look identical.
+         if (remoteStartNeedsCredit.exchange(false)) {
+            PressAction(VPXACTION_AddCredit, 80);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
          }
-      } catch (...) { }
+         PressAction(VPXACTION_StartGame, 80);
+         HttpSender::PostJson("/api/emit",
+            "{\"type\":\"system\",\"tag\":\"CABINET\",\"label\":\"Start pressed from the app\","
+            "\"detail\":\"the queued player took their turn from their phone\"}");
+      }
    }
 
    void Run()
@@ -1421,6 +1437,96 @@ private:
 };
 
 static std::unique_ptr<ScorePoller> scorePoller;
+
+// ── The remote start, long-polled ────────────────────────────────────────────────────────────
+// THE ONE JOB: notice "startNow" as fast as possible. Used to be a ~1s-worst-case slice of
+// ScorePoller's 200ms tick (tick % 5); moved to its own thread so it can hold a GET open on
+// /api/table/lock?wait=<ms> instead of asking on a fixed schedule -- the server replies the
+// instant a claim/release/queue-tick actually changes something (see tableLockSignal.bump() in
+// server.js), so a claim reaches this thread in roughly one HTTP round trip, not up to a second.
+//
+// Same thread-lifecycle shape as GainPoller/ViewPoller above, with one addition: the socket a
+// long-poll is blocked on has to be interruptible, or shutting this plugin down (a table switch,
+// Stop) could stall for the full long-poll timeout waiting for a recv() that a normal 200ms
+// poller would never have had to wait out. See GetBody's liveSocketOut parameter.
+class LockPoller
+{
+public:
+   LockPoller() { m_thread = std::thread(&LockPoller::Run, this); }
+   ~LockPoller()
+   {
+      { std::lock_guard<std::mutex> lock(m_mutex); m_stopRequested = true; }
+      m_cv.notify_one();
+      // Unblock a recv() that may be mid-flight right now, race-free against Run()'s own close()
+      // -- see GetBody's comment for why exchange()+shutdown() here can never double-close or
+      // touch a reused fd.
+      const int fd = m_liveSocket.exchange(-1);
+      if (fd >= 0) {
+#ifdef _WIN32
+         shutdown((SOCKET)fd, SD_BOTH);
+#else
+         shutdown(fd, SHUT_RDWR);
+#endif
+      }
+      if (m_thread.joinable())
+         m_thread.join();
+   }
+   LockPoller(const LockPoller&) = delete;
+   LockPoller& operator=(const LockPoller&) = delete;
+
+private:
+   static constexpr int WAIT_MS = 15000;      // server-side long-poll hold
+   static constexpr int SOCKET_TIMEOUT_MS = 16000; // > WAIT_MS, or the socket races the server's own reply
+   static constexpr int BACKOFF_START_MS = 1000;
+   static constexpr int BACKOFF_MAX_MS = 5000;
+
+   void Run()
+   {
+      int backoffMs = BACKOFF_START_MS;
+      while (true) {
+         {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_stopRequested)
+               return;
+         }
+         const std::string path = "/api/table/lock?wait=" + std::to_string(WAIT_MS);
+         const std::string body = HttpSender::GetBody(path.c_str(), SOCKET_TIMEOUT_MS, &m_liveSocket);
+         if (body.empty()) {
+            // Dashboard unreachable, or we were just interrupted for shutdown -- either way,
+            // don't spin a blocking connect at full speed. A stop request wakes this wait early.
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_cv.wait_for(lock, std::chrono::milliseconds(backoffMs), [this] { return m_stopRequested; }))
+               return;
+            backoffMs = std::min(backoffMs * 2, BACKOFF_MAX_MS);
+            continue;
+         }
+         backoffMs = BACKOFF_START_MS;
+         try {
+            const nlohmann::json parsed = nlohmann::json::parse(body);
+            if (parsed.contains("locked") && parsed["locked"].is_boolean())
+               SetLockFromServer(parsed["locked"].get<bool>(), parsed.value("lockMaxMs", (uint64_t)0));
+            // The remote start. One-shot on the SERVER's side: it clears startNow the moment it
+            // hands this reply over, so a poll that arrives twice cannot start two games. This
+            // thread only DETECTS it and hands off to ScorePoller's thread for the actual press
+            // -- see remoteStartPending's comment for why the press itself can't happen here.
+            if (parsed.value("startNow", false)) {
+               if (parsed.value("addCredit", false))
+                  remoteStartNeedsCredit.store(true);
+               remoteStartPending.store(true);
+            }
+         } catch (...) { }
+      }
+   }
+
+   std::atomic<int> m_liveSocket { -1 };
+   std::mutex m_mutex;
+   std::condition_variable m_cv;
+   bool m_stopRequested = false;
+   std::thread m_thread;
+};
+
+static std::unique_ptr<LockPoller> lockPoller;
+
 static unsigned int onControllersChangedId = 0;
 static unsigned int onActionChangedId = 0;
 static unsigned int getControllersId = 0;
@@ -1511,6 +1617,7 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
 
    sender = std::make_unique<HttpSender>();
    scorePoller = std::make_unique<ScorePoller>(sender.get());
+   lockPoller = std::make_unique<LockPoller>();
    b2sPluginEventStream = std::make_unique<B2SPluginEventStream>(msgApi, endpointId, [](char type, int id, int value) {
       if (HttpSender* s = sender.get())
          s->PostEvent(type, id, value);
@@ -1572,6 +1679,8 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
    // order on unload, or a marshalled ApplyPending could run after its plugin state is gone.
    gainPoller = nullptr;
    viewPoller = nullptr;
+   lockPoller = nullptr;   // ~LockPoller() shutdown()s a mid-flight long-poll rather than
+                            // waiting out its timeout -- see its destructor
    if (msgApi)
       msgApi->FlushPendingCallbacks(endpointId);
    {
