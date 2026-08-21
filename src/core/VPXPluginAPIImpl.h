@@ -79,6 +79,7 @@ private:
 
    static void MSGPIAPI GetInputState(VPXInputState* state);
    static void MSGPIAPI SetInputState(VPXInputState* state);
+   static void MSGPIAPI CaptureScreenshot(VPXWindowId window, const char* path);
    ankerl::unordered_dense::map<VPXAction, std::pair<unsigned int, int>> m_actionMap;
 
 public:

@@ -1527,6 +1527,87 @@ private:
 
 static std::unique_ptr<LockPoller> lockPoller;
 
+// ── Debug screenshots of VPX's own windows -- see server.js's ENGINE_WINDOWS comment ────────
+// Short-interval poll (this is an interactive dev tool, not a latency-sensitive path, so a plain
+// fixed-interval poll is the right amount of machinery -- no need for LockPoller's long-poll).
+// vpxApi->CaptureScreenshot is fire-and-forget with no completion signal through the C API, so
+// this polls for the output FILE to appear instead, same pattern `cab shotremote` itself uses
+// one layer up.
+class ScreenshotPoller
+{
+public:
+   ScreenshotPoller() { m_thread = std::thread(&ScreenshotPoller::Run, this); }
+   ~ScreenshotPoller()
+   {
+      { std::lock_guard<std::mutex> lock(m_mutex); m_stopRequested = true; }
+      m_cv.notify_one();
+      if (m_thread.joinable())
+         m_thread.join();
+   }
+   ScreenshotPoller(const ScreenshotPoller&) = delete;
+   ScreenshotPoller& operator=(const ScreenshotPoller&) = delete;
+
+private:
+   static VPXWindowId ResolveWindow(const std::string& name)
+   {
+      if (name == "playfield") return VPXWINDOW_Playfield;
+      if (name == "backglass") return VPXWINDOW_Backglass;
+      if (name == "scoreview") return VPXWINDOW_ScoreView;
+      if (name == "topper") return VPXWINDOW_Topper;
+      return VPXWINDOW_VRPreview; // sentinel: not one of the four this plugin captures
+   }
+
+   void Run()
+   {
+      while (true) {
+         {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_cv.wait_for(lock, std::chrono::milliseconds(500), [this] { return m_stopRequested; });
+            if (m_stopRequested)
+               return;
+         }
+         const std::string body = HttpSender::GetBody("/api/engine-screenshot-request");
+         if (body.empty())
+            continue;
+         try {
+            const nlohmann::json parsed = nlohmann::json::parse(body);
+            if (!parsed.contains("id"))
+               continue;
+            const std::string id = parsed["id"].get<std::string>();
+            const std::string windowName = parsed.value("window", "");
+            const VPXWindowId windowId = ResolveWindow(windowName);
+            if (windowId == VPXWINDOW_VRPreview || !vpxApi || !vpxApi->CaptureScreenshot) {
+               HttpSender::PostJson("/api/screenshot-result",
+                  "{\"id\":\"" + id + "\",\"error\":\"unknown engine window or vpxApi unavailable: " + windowName + "\"}");
+               continue;
+            }
+            const std::string outPath = "/tmp/cab-remote-shot-" + id + ".png";
+            vpxApi->CaptureScreenshot(windowId, outPath.c_str());
+            // A few render frames' delay (see CaptureScreenshot's own frameDelay=3) plus margin
+            // for a slow machine -- poll for the file rather than guess one fixed sleep.
+            bool found = false;
+            for (int i = 0; i < 20 && !found; i++) {
+               std::this_thread::sleep_for(std::chrono::milliseconds(100));
+               std::error_code ec;
+               found = std::filesystem::exists(outPath, ec) && !ec;
+            }
+            if (found)
+               HttpSender::PostJson("/api/screenshot-result", "{\"id\":\"" + id + "\",\"path\":\"" + outPath + "\"}");
+            else
+               HttpSender::PostJson("/api/screenshot-result",
+                  "{\"id\":\"" + id + "\",\"error\":\"capture timed out -- no file after 2s (table not running, or a capture was already in flight)\"}");
+         } catch (...) { }
+      }
+   }
+
+   std::mutex m_mutex;
+   std::condition_variable m_cv;
+   bool m_stopRequested = false;
+   std::thread m_thread;
+};
+
+static std::unique_ptr<ScreenshotPoller> screenshotPoller;
+
 static unsigned int onControllersChangedId = 0;
 static unsigned int onActionChangedId = 0;
 static unsigned int getControllersId = 0;
@@ -1618,6 +1699,7 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    sender = std::make_unique<HttpSender>();
    scorePoller = std::make_unique<ScorePoller>(sender.get());
    lockPoller = std::make_unique<LockPoller>();
+   screenshotPoller = std::make_unique<ScreenshotPoller>();
    b2sPluginEventStream = std::make_unique<B2SPluginEventStream>(msgApi, endpointId, [](char type, int id, int value) {
       if (HttpSender* s = sender.get())
          s->PostEvent(type, id, value);
@@ -1681,6 +1763,7 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
    viewPoller = nullptr;
    lockPoller = nullptr;   // ~LockPoller() shutdown()s a mid-flight long-poll rather than
                             // waiting out its timeout -- see its destructor
+   screenshotPoller = nullptr;
    if (msgApi)
       msgApi->FlushPendingCallbacks(endpointId);
    {

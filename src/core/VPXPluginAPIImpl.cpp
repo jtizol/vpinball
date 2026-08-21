@@ -193,6 +193,29 @@ void MSGPIAPI VPXPluginAPIImpl::SetInputState(VPXInputState* state)
    state->stateMask = 0;
 }
 
+// Reads directly from the render device's own framebuffer, never through the window server, so
+// no OS screen-recording permission is needed for whatever process this plugin runs in -- see
+// VPXPlugin.h's CaptureScreenshot for the full rationale. Mirrors the internal call already used
+// for attract-mode video capture (player.cpp's UpdateCaptureBuffer), just with a single window
+// resolved from the plugin-facing VPXWindowId instead of a hardcoded playfield/backglass pair.
+void MSGPIAPI VPXPluginAPIImpl::CaptureScreenshot(VPXWindowId window, const char* path)
+{
+   if (!g_pplayer || !path || !*path)
+      return;
+   VPX::Window* wnd = nullptr;
+   switch (window)
+   {
+   case VPXWINDOW_Playfield: wnd = g_pplayer->m_playfieldWnd; break;
+   case VPXWINDOW_Backglass: wnd = g_pplayer->m_backglassOutput.GetWindow(); break;
+   case VPXWINDOW_ScoreView: wnd = g_pplayer->m_scoreViewOutput.GetWindow(); break;
+   case VPXWINDOW_Topper: wnd = g_pplayer->m_topperOutput.GetWindow(); break;
+   default: return; // VR preview and anything future: not wired up, silently no-op rather than crash
+   }
+   if (!wnd)
+      return; // that output isn't a real window on this cabinet right now (disabled/embedded)
+   g_pplayer->m_renderer->m_renderDevice->CaptureScreenshot({ wnd }, { std::filesystem::path(path) }, [](bool) {}, 3);
+}
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // Game State
@@ -762,6 +785,8 @@ VPXPluginAPIImpl::VPXPluginAPIImpl(MsgPI::MsgPluginManager& pluginManager)
    m_api.UpdateTexture = UpdateTexture;
    m_api.GetTextureInfo = GetTextureInfo;
    m_api.DeleteTexture = DeleteTexture;
+
+   m_api.CaptureScreenshot = CaptureScreenshot;
 
    m_vpxPlugin = pluginManager.RegisterPlugin(
       "vpx"s, "VPX"s, "Visual Pinball X"s, ""s, ""s, "https://github.com/vpinball/vpinball"s, //

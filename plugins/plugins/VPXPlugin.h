@@ -295,4 +295,15 @@ typedef struct VPXPluginAPI
    // Thread safe
    void(MSGPIAPI* DeleteTexture)(VPXTexture texture);
 
+   // Capture one of VPX's own windows (Playfield/Backglass/ScoreView/Topper) to a PNG file,
+   // reading directly from the render device's own framebuffer -- this never goes through the
+   // window server, so it needs no OS screen-recording permission for the calling process.
+   // Fire-and-forget and async: queues the capture (a few frames' delay to let the current
+   // frame settle) and returns immediately. The caller should poll for `path` to appear on
+   // disk, with its own timeout -- there is no completion signal back through this API. A
+   // second call while one is already in flight is dropped (VPX logs it), so don't pipeline
+   // these; wait for the file before requesting another.
+   // Thread safe (this is explicitly designed to be called off the render thread).
+   void(MSGPIAPI* CaptureScreenshot)(VPXWindowId window, const char* path);
+
 } VPXPluginAPI;
