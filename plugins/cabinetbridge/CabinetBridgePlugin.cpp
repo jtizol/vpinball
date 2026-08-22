@@ -7,6 +7,9 @@
 #include "pinmame/libpinmame.h"
 #include "nlohmann/json.hpp"
 
+#include <SDL3/SDL_audio.h>
+#include <SDL3/SDL_init.h>
+
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -21,6 +24,7 @@
 #include <map>
 #include <cmath>
 #include <algorithm>
+#include <random>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -641,6 +645,140 @@ private:
 };
 
 static std::unique_ptr<AudioMeter> audioMeter;
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// Rear exciter audio -- the "continuous texture (ball roll)" case
+// docs/decisions/ssf-exciter-build.md left as an unscoped research spike, now that
+// VPXPluginAPI::GetActiveBalls exists (this session). A continuous filtered-noise "rumble" is
+// generated HERE, in-process, panned between two channels by ball X position -- deliberately
+// NOT routed through the dashboard: a rumble that lagged 200ms behind the actual ball would feel
+// disconnected from the game, and ssf-exciter-build.md's own ExciterRouter sketch already
+// reasoned that the discrete solenoid case belongs in-process for the same latency reason.
+//
+// TARGETS THE DEFAULT OUTPUT DEVICE, not the multichannel exciter interface -- that hardware
+// hasn't been bought yet (see ssf-exciter-build.md's "Blocked on" list, unchanged). This opens
+// its OWN independent SDL logical device (SDL3's logical-device model explicitly supports this,
+// see SDL_audio.h's "Logical audio devices" section -- multiple independent parts of a process
+// can each open a device against the same physical hardware without stepping on each other, or
+// on VPX's own AudioPlayer), so it can be heard and tuned through ordinary speakers/headphones
+// today. Swapping the target device to a real multichannel interface later is a constructor
+// argument change, not a redesign.
+//
+// GAIN, NOT A SAMPLE PLAYER: unlike the discrete-hit "thunk" case (a short clip fired once per
+// solenoid event), this needs a signal that's already playing and continuously amplitude-
+// modulated -- so it's a live generator, not clip playback. Filtered white noise (single-pole
+// low-pass per channel) rather than a recorded sample: cheap, tunable, no asset dependency, and
+// the "attack/release" smoothing on the way to audible gain avoids the click a hard gain jump
+// would produce.
+//
+// PRESENCE-ONLY GAIN CEILING (PRESENCE_GAIN below), not full velocity-scaled range: nothing here
+// has been calibrated against a real table's actual ball-speed numbers yet (the one live sample
+// seen so far, AFM balls sitting in the trough, read vx/vy in the 0.01-0.1 range -- too small a
+// sample to derive a scale from). Shipping a confident-looking speed curve built on that would
+// be worse than a flat, audible rumble while a ball is present. Revisit once more live play has
+// established what real in-motion speed values look like.
+class ExciterAudio
+{
+public:
+   ExciterAudio()
+   {
+      SDL_AudioSpec spec { SDL_AUDIO_F32, 2, 44100 };
+      m_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec);
+      if (m_device == 0)
+         return; // no output device available -- balls will still be tracked, just silent
+      m_stream = SDL_CreateAudioStream(&spec, &spec);
+      if (!m_stream) {
+         SDL_CloseAudioDevice(m_device);
+         m_device = 0;
+         return;
+      }
+      SDL_BindAudioStream(m_device, m_stream);
+      SDL_ResumeAudioStreamDevice(m_stream);
+      m_thread = std::thread(&ExciterAudio::Run, this);
+   }
+   ~ExciterAudio()
+   {
+      m_stopRequested.store(true);
+      if (m_thread.joinable())
+         m_thread.join();
+      if (m_stream)
+         SDL_DestroyAudioStream(m_stream); // also unbinds
+      if (m_device)
+         SDL_CloseAudioDevice(m_device);
+   }
+   ExciterAudio(const ExciterAudio&) = delete;
+   ExciterAudio& operator=(const ExciterAudio&) = delete;
+
+   // Called from ScorePoller's 200ms tick with the current rear-half ball state. Panned by X
+   // (0 = full left, 1 = full right), gated by Y (only balls in the rear half count at all) --
+   // matches Hardware Map View's own rear-left/rear-right split exactly, so what you see there
+   // and what you hear here are describing the same thing.
+   void SetTarget(bool ballInRear, float panWeight)
+   {
+      if (!ballInRear) {
+         m_targetLeft.store(0.f);
+         m_targetRight.store(0.f);
+         return;
+      }
+      m_targetLeft.store(PRESENCE_GAIN * (1.f - panWeight));
+      m_targetRight.store(PRESENCE_GAIN * panWeight);
+   }
+
+   // What's actually audible right now (post-smoothing), for reporting to the dashboard --
+   // Hardware Map View's level meters read this, not the raw target, so what's drawn matches
+   // what's actually playing rather than the instantaneous, un-smoothed input.
+   void GetLevels(float& left, float& right) const
+   {
+      left = m_levelLeft.load();
+      right = m_levelRight.load();
+   }
+
+private:
+   static constexpr float PRESENCE_GAIN = 0.35f; // moderate on purpose -- see class comment
+   // One pole toward the target per ~10ms buffer tick. ~0.08 gives roughly a 100-150ms glide,
+   // audibly smooth without feeling laggy against a 200ms ball-position update.
+   static constexpr float SMOOTHING = 0.08f;
+   // Single-pole low-pass coefficient on the raw noise, independent of the gain smoothing above
+   // -- this is what turns hiss into "rumble" in the first place, not what controls its volume.
+   static constexpr float NOISE_LOWPASS = 0.02f;
+
+   void Run()
+   {
+      std::mt19937 rng(12345);
+      std::uniform_real_distribution<float> noise(-1.f, 1.f);
+      float lpLeft = 0.f, lpRight = 0.f;
+      constexpr int FRAMES_PER_CHUNK = 441; // ~10ms at 44100Hz -- small enough to stay responsive
+      std::vector<float> buf(FRAMES_PER_CHUNK * 2);
+      while (!m_stopRequested.load()) {
+         // Keep at most ~40ms queued. Filling further ahead would make SetTarget's gain changes
+         // (and therefore the smoothing above) audible later than they should be.
+         if (SDL_GetAudioStreamQueued(m_stream) < FRAMES_PER_CHUNK * 2 * (int)sizeof(float) * 4) {
+            m_levelLeft.store(m_levelLeft.load() + SMOOTHING * (m_targetLeft.load() - m_levelLeft.load()));
+            m_levelRight.store(m_levelRight.load() + SMOOTHING * (m_targetRight.load() - m_levelRight.load()));
+            const float gL = m_levelLeft.load(), gR = m_levelRight.load();
+            for (int i = 0; i < FRAMES_PER_CHUNK; i++) {
+               lpLeft += NOISE_LOWPASS * (noise(rng) - lpLeft);
+               lpRight += NOISE_LOWPASS * (noise(rng) - lpRight);
+               buf[i * 2] = lpLeft * gL;
+               buf[i * 2 + 1] = lpRight * gR;
+            }
+            SDL_PutAudioStreamData(m_stream, buf.data(), (int)(buf.size() * sizeof(float)));
+         }
+         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+   }
+
+   SDL_AudioDeviceID m_device = 0;
+   SDL_AudioStream* m_stream = nullptr;
+   std::thread m_thread;
+   std::atomic<bool> m_stopRequested { false };
+   std::atomic<float> m_targetLeft { 0.f }, m_targetRight { 0.f };
+   std::atomic<float> m_levelLeft { 0.f }, m_levelRight { 0.f };
+};
+
+static std::unique_ptr<ExciterAudio> exciterAudio;
+
 static std::mutex gainPollerMutex;
 static std::unique_ptr<std::map<std::string, float>> gainPollerPending;
 static unsigned int onAudioUpdateId = 0;
@@ -1347,14 +1485,60 @@ private:
          return;
       VPXBallInfo balls[16]; // more balls than any real machine locks at once; extras are dropped, not crashed on
       const int n = vpxApi->GetActiveBalls(balls, 16);
-      if (n <= 0)
-         return; // nothing in play -- no point posting an empty tick 5x/sec
+      // Silence the exciter audio the moment nothing is in play (n<=0: between games, or no
+      // table running at all) -- this runs regardless of whether we go on to POST below, so a
+      // rumble left over from the last ball drained never outlives it.
+      if (exciterAudio) {
+         if (n <= 0) {
+            exciterAudio->SetTarget(false, 0.f);
+         } else {
+            VPXTableInfo tableForAudio {};
+            vpxApi->GetTableInfo(&tableForAudio);
+            bool inRear = false;
+            float panWeight = 0.f;
+            if (tableForAudio.tableWidth > 0 && tableForAudio.tableHeight > 0) {
+               for (int i = 0; i < n; i++) {
+                  if (balls[i].y > tableForAudio.tableHeight / 2.f)
+                     continue; // front half -- not a rear-exciter concern, see Hardware Map's own split
+                  inRear = true;
+                  // Last ball found wins on ties -- matches the visual glow's own "any ball in
+                  // the half lights it" simplicity rather than trying to blend multiple balls.
+                  panWeight = std::clamp(balls[i].x / tableForAudio.tableWidth, 0.f, 1.f);
+               }
+            }
+            exciterAudio->SetTarget(inRear, panWeight);
+         }
+      }
+      // n<=0 usually means "no point posting an empty tick 5x/sec" -- EXCEPT while the exciter
+      // audio is still audibly decaying toward silence (SetTarget above set the target to 0,
+      // but SMOOTHING glides there over ~100-150ms, not instantly). Without this exception, the
+      // dashboard's last-seen level freezes at whatever it was the instant the ball drained,
+      // instead of tracking the fade the speaker is actually doing -- a real, if minor, gap
+      // between what's drawn and what's audible.
+      if (n <= 0) {
+         float levelLeft = 0.f, levelRight = 0.f;
+         if (exciterAudio)
+            exciterAudio->GetLevels(levelLeft, levelRight);
+         if (levelLeft < 0.001f && levelRight < 0.001f)
+            return; // already silent -- nothing left to report
+         nlohmann::json decay = { { "balls", nlohmann::json::array() }, { "tableWidth", 0 }, { "tableHeight", 0 },
+            { "exciterLevels", { { "rear-left", levelLeft }, { "rear-right", levelRight } } } };
+         HttpSender::PostJson("/api/ball-positions", decay.dump());
+         return;
+      }
       VPXTableInfo table {};
       vpxApi->GetTableInfo(&table);
       nlohmann::json arr = nlohmann::json::array();
       for (int i = 0; i < n; i++)
          arr.push_back({ { "x", balls[i].x }, { "y", balls[i].y }, { "vx", balls[i].vx }, { "vy", balls[i].vy } });
       nlohmann::json event = { { "balls", arr }, { "tableWidth", table.tableWidth }, { "tableHeight", table.tableHeight } };
+      if (exciterAudio) {
+         float levelLeft = 0.f, levelRight = 0.f;
+         exciterAudio->GetLevels(levelLeft, levelRight);
+         // rear-left/rear-right, matching Hardware Map View's own zone names exactly -- see
+         // ExciterAudio's class comment for why left=rear-left and right=rear-right.
+         event["exciterLevels"] = { { "rear-left", levelLeft }, { "rear-right", levelRight } };
+      }
       HttpSender::PostJson("/api/ball-positions", event.dump());
    }
 
@@ -1759,6 +1943,12 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
 
    // Passive tap on the audio broadcast PinMAME/PUP/AltSound already send -- see AudioMeter.
    audioMeter = std::make_unique<AudioMeter>();
+
+   // Own independent output for the rear-exciter rumble -- see ExciterAudio's own class
+   // comment. Constructed here (not lazily on first ball) so it's ready the instant ScorePoller
+   // starts calling SetTarget; opening an SDL device takes long enough that doing it on the
+   // first physics tick would risk missing that tick's rumble.
+   exciterAudio = std::make_unique<ExciterAudio>();
    onAudioUpdateId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_UPDATE_MSG);
    onAudioSrcChangedId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_ON_SRC_CHG_MSG);
    getAudioSrcId = msgApi->GetMsgID(CTLPI_NAMESPACE, CTLPI_AUDIO_GET_SRC_MSG);
@@ -1808,7 +1998,10 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
    }
    audioMeter = nullptr;           // unsubscribe BEFORE this, so no callback lands on a dead meter
    b2sPluginEventStream = nullptr; // stop the event stream first, so nothing posts to a dying sender
-   scorePoller = nullptr;          // ~ScorePoller() joins its thread
+   scorePoller = nullptr;          // ~ScorePoller() joins its thread -- MUST come before
+                                    // exciterAudio, so no in-flight PollBalls() call can reach a
+                                    // freed ExciterAudio through the global pointer
+   exciterAudio = nullptr;         // ~ExciterAudio() joins its generator thread, closes the device
    sender = nullptr;               // ~HttpSender() joins its thread, flushing/dropping cleanly
    msgApi = nullptr;
 }

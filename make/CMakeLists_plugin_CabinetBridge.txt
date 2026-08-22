@@ -31,7 +31,8 @@ if(BUILD_SHARED)
    )
 
    if(PLATFORM STREQUAL "windows" OR PLATFORM STREQUAL "windows-mingw")
-      target_link_libraries(CabinetBridgePlugin PUBLIC ws2_32 $<IF:$<STREQUAL:${ARCH},x64>,pinmame64,pinmame>)
+      target_link_libraries(CabinetBridgePlugin PUBLIC ws2_32 $<IF:$<STREQUAL:${ARCH},x64>,pinmame64,pinmame>
+         $<IF:$<STREQUAL:${ARCH},x64>,SDL364,SDL3>)
       if(MSVC)
          set_target_properties(CabinetBridgePlugin PROPERTIES
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
@@ -74,7 +75,10 @@ if(BUILD_SHARED)
       # RUNTIME_LIBS_DIR (not BUILD_LIBS_DIR) is where macOS's libpinmame.dylib actually lives --
       # matches CMakeLists_plugin_PinMAME.txt's own macOS-specific target_link_directories.
       target_link_directories(CabinetBridgePlugin PUBLIC ${RUNTIME_LIBS_DIR})
-      target_link_libraries(CabinetBridgePlugin PUBLIC pinmame)
+      # SDL3 -- the exciter-audio generator opens its own independent output device/stream
+      # (see ExciterAudio in CabinetBridgePlugin.cpp) the same way plugins/pup already does,
+      # not by reusing VPX's own device.
+      target_link_libraries(CabinetBridgePlugin PUBLIC pinmame SDL3)
       set_target_properties(CabinetBridgePlugin PROPERTIES
          PREFIX ""
          OUTPUT_NAME "plugin-cabinetbridge"
