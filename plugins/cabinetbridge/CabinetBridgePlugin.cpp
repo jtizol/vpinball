@@ -1157,21 +1157,42 @@ static unsigned int onAudioCmdId = 0;
 
 // PinMAME already logs the sound-board command byte the main CPU sends BEFORE any decoding or
 // mixing happens (wmssnd.c's dcs_data_w -> sndbrd.c's snd_cmd_log -> this message) -- a discrete
-// "play sound #N" event, not audio. Forwarded the same way every other raw event is (broadcast-
-// only via /api/emit, never logAction'd -- a busy table could send one of these on nearly every
-// hit, same volume reasoning as switches/solenoids).
+// "play sound #N" event, not audio.
 //
 // WHAT THIS DOES NOT DO: say what command N MEANS. There is no lookup here (or anywhere yet)
 // from a command byte to "this is the jackpot callout" vs "this is background music track 3" --
 // that mapping is per-ROM and undiscovered, the same kind of gap the solenoid ids had before
 // PinMAME's own driver source resolved them. This just makes the raw signal visible; reading
 // it is future work, same sequencing as every other "map it, then use it" step in this project.
+//
+// FOUND LIVE, THE HARD WAY (2026-08-22): this message is NOT PinMAME's emulation thread -- its
+// source, libpinmame_snd_cmd_log, marshals via msgApi->RunOnMainThread with a fresh `new
+// PinMAMEChildBoardEventMsg` PER CALL (libpinmame.cpp's OnSoundCommand/libpinmame_snd_cmd_log).
+// The first version of this handler called sender->PostEvent() (a mutex lock + queue push)
+// directly from here -- i.e. on VPX's own MAIN/RENDER THREAD, once per call. On a real table
+// this fires often enough (an alternating command pair observed within a single second on the
+// Event Bus) that doing real work per call froze the ENTIRE cabinet solid for minutes: no new
+// switch/lamp/solenoid/anything reached the dashboard, because the main thread queue was being
+// swamped, not because PinMAME itself stalled. VPX's own process stayed alive and burning CPU
+// the whole time -- confirmed live, this was not a crash, it was contention.
+//
+// THE FIX: this handler now does the absolute minimum -- one atomic store, no lock, no
+// allocation, no network call. ScorePoller's existing 200ms tick (Run(), already the one
+// thread confirmed safe for this kind of work -- see PollBalls' own comment) picks up whatever
+// the LATEST command was and forwards just that one. A rapid back-and-forth between two
+// commands within one 200ms window is coalesced to whichever was last -- an accepted loss of
+// fidelity, the same tradeoff ball position already makes at this same cadence, in exchange for
+// never being able to freeze the cabinet regardless of how fast the real hardware chatters.
+static std::atomic<uint64_t> g_lastSoundCmd { 0 }; // (boardNo << 32) | cmd
+static std::atomic<bool> g_soundCmdDirty { false };
+
 static void OnAudioCmd(const unsigned int eventId, void* userData, void* msgData)
 {
-   if (!msgData || !sender)
+   if (!msgData)
       return;
    const PinMAMEChildBoardEventMsg& msg = *static_cast<PinMAMEChildBoardEventMsg*>(msgData);
-   sender->PostEvent('A', (int)msg.boardNo, (int)msg.cmd);
+   g_lastSoundCmd.store((static_cast<uint64_t>(msg.boardNo) << 32) | msg.cmd, std::memory_order_relaxed);
+   g_soundCmdDirty.store(true, std::memory_order_relaxed);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1568,6 +1589,19 @@ private:
       HttpSender::PostJson("/api/ball-positions", event.dump());
    }
 
+   // The forwarding half of OnAudioCmd's atomic handoff -- see that function's own comment for
+   // why the handler itself does no work. Same 200ms cadence as PollBalls above, on the same
+   // thread PollLock's own comment already documents as the one thing here that ticks
+   // regardless of anything else. exchange(false) both reads and clears the flag atomically, so
+   // a command landing between the check and the read can't be silently dropped.
+   void PollSoundCmd()
+   {
+      if (!g_soundCmdDirty.exchange(false, std::memory_order_relaxed) || !m_sender)
+         return;
+      const uint64_t packed = g_lastSoundCmd.load(std::memory_order_relaxed);
+      m_sender->PostEvent('A', static_cast<int>(packed >> 32), static_cast<int>(packed & 0xFFFFFFFFu));
+   }
+
    void Run()
    {
       int tick = 0;
@@ -1586,6 +1620,8 @@ private:
          // Also before the romMap check -- ball position comes from VPX's own physics, not the
          // ROM's memory map, so a table with no known score layout still gets exciter data.
          PollBalls();
+         // Same reasoning again -- a sound command has nothing to do with the score memory map.
+         PollSoundCmd();
          if (romMap.empty())
             continue;
          const std::vector<ScoreField>& fields = romMap.scores;
