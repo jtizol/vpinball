@@ -1176,23 +1176,40 @@ static unsigned int onAudioCmdId = 0;
 // swamped, not because PinMAME itself stalled. VPX's own process stayed alive and burning CPU
 // the whole time -- confirmed live, this was not a crash, it was contention.
 //
-// THE FIX: this handler now does the absolute minimum -- one atomic store, no lock, no
-// allocation, no network call. ScorePoller's existing 200ms tick (Run(), already the one
-// thread confirmed safe for this kind of work -- see PollBalls' own comment) picks up whatever
-// the LATEST command was and forwards just that one. A rapid back-and-forth between two
-// commands within one 200ms window is coalesced to whichever was last -- an accepted loss of
-// fidelity, the same tradeoff ball position already makes at this same cadence, in exchange for
-// never being able to freeze the cabinet regardless of how fast the real hardware chatters.
-static std::atomic<uint64_t> g_lastSoundCmd { 0 }; // (boardNo << 32) | cmd
-static std::atomic<bool> g_soundCmdDirty { false };
+// THE FIX: this handler now does the absolute minimum -- no allocation, no network call, and
+// the one lock it takes guards nothing but an 8-slot fixed array (no growth, ever) -- the same
+// "brief lock in a hot path" shape AudioMeter::Accumulate already uses safely just above, unlike
+// the original mistake here (a mutex+queue+eventual-HTTP chain doing real work per call).
+//
+// A RING, NOT A SINGLE LATEST VALUE -- upgraded from the first version of this fix (single
+// atomic, "last value wins"). That was safe but lossy: if a real game fires two DIFFERENT
+// commands within one 200ms tick (a bumper cue immediately followed by a music change, say),
+// the first would vanish before ScorePoller ever saw it -- exactly the kind of gap that would
+// make correlating a command against a known switch/score moment unreliable. Consecutive
+// REPEATS of the same value (the attract-mode "211 forty-seven times" case, almost certainly a
+// heartbeat/reassert rather than a distinct trigger) are still deduped at the point of entry, so
+// this doesn't turn noise into ring pressure -- only genuine changes ever get a slot.
+static constexpr int SOUNDCMD_RING_SIZE = 8; // far more than one 200ms tick should ever need
+static std::mutex g_soundCmdMutex;
+struct SoundCmdEntry { uint32_t boardNo; uint32_t cmd; };
+static SoundCmdEntry g_soundCmdRing[SOUNDCMD_RING_SIZE];
+static int g_soundCmdRingCount = 0;
+static uint32_t g_lastSoundCmdValue = 0xFFFFFFFFu; // sentinel: no real cmd is this on any board
 
 static void OnAudioCmd(const unsigned int eventId, void* userData, void* msgData)
 {
    if (!msgData)
       return;
    const PinMAMEChildBoardEventMsg& msg = *static_cast<PinMAMEChildBoardEventMsg*>(msgData);
-   g_lastSoundCmd.store((static_cast<uint64_t>(msg.boardNo) << 32) | msg.cmd, std::memory_order_relaxed);
-   g_soundCmdDirty.store(true, std::memory_order_relaxed);
+   std::lock_guard<std::mutex> lock(g_soundCmdMutex);
+   if (msg.cmd == g_lastSoundCmdValue)
+      return; // a repeat of the same command -- not a new event, don't spend a ring slot on it
+   g_lastSoundCmdValue = msg.cmd;
+   if (g_soundCmdRingCount < SOUNDCMD_RING_SIZE)
+      g_soundCmdRing[g_soundCmdRingCount++] = { msg.boardNo, msg.cmd };
+   // else: ring full (8 distinct commands inside one 200ms tick) -- drop silently rather than
+   // grow or block. Losing the 9th-and-beyond distinct value in one tick is an accepted edge
+   // case; looping/allocating here to avoid it would reopen the exact risk this fix removes.
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1589,17 +1606,28 @@ private:
       HttpSender::PostJson("/api/ball-positions", event.dump());
    }
 
-   // The forwarding half of OnAudioCmd's atomic handoff -- see that function's own comment for
-   // why the handler itself does no work. Same 200ms cadence as PollBalls above, on the same
-   // thread PollLock's own comment already documents as the one thing here that ticks
-   // regardless of anything else. exchange(false) both reads and clears the flag atomically, so
-   // a command landing between the check and the read can't be silently dropped.
+   // The forwarding half of OnAudioCmd's ring handoff -- see that function's own comment for
+   // why the handler itself does no HTTP-adjacent work. Same 200ms cadence as PollBalls above,
+   // on the same thread PollLock's own comment already documents as the one thing here that
+   // ticks regardless of anything else. Drains and forwards EVERY distinct command queued since
+   // the last tick (not just the latest), copying the ring out under the lock and doing the
+   // actual PostEvent calls after releasing it -- so the lock's held for a memcpy, not for
+   // however long N network-adjacent enqueues take.
    void PollSoundCmd()
    {
-      if (!g_soundCmdDirty.exchange(false, std::memory_order_relaxed) || !m_sender)
+      if (!m_sender)
          return;
-      const uint64_t packed = g_lastSoundCmd.load(std::memory_order_relaxed);
-      m_sender->PostEvent('A', static_cast<int>(packed >> 32), static_cast<int>(packed & 0xFFFFFFFFu));
+      SoundCmdEntry batch[SOUNDCMD_RING_SIZE];
+      int count;
+      {
+         std::lock_guard<std::mutex> lock(g_soundCmdMutex);
+         count = g_soundCmdRingCount;
+         for (int i = 0; i < count; i++)
+            batch[i] = g_soundCmdRing[i];
+         g_soundCmdRingCount = 0;
+      }
+      for (int i = 0; i < count; i++)
+         m_sender->PostEvent('A', static_cast<int>(batch[i].boardNo), static_cast<int>(batch[i].cmd));
    }
 
    void Run()
