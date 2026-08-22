@@ -79,6 +79,11 @@ static const char* TypeName(char c)
       case 'S': return "solenoid";
       case 'G': return "gi";
       case 'C': return "score";
+      // The raw command byte the main CPU just sent to a sound/DMD board (PMPI_EVT_ON_AUDIO_CMD),
+      // BEFORE it's decoded into PCM or mixed with anything else -- "play sound #0x2f" as a
+      // discrete, named event, not audio. See OnAudioCmd below for why this exists and what it
+      // doesn't (yet) tell you.
+      case 'A': return "soundcmd";
       default: return nullptr; // not forwarded
    }
 }
@@ -1148,6 +1153,27 @@ static void OnAudioSrcChanged(const unsigned int eventId, void* userData, void* 
       audioMeter->RefreshNames();
 }
 
+static unsigned int onAudioCmdId = 0;
+
+// PinMAME already logs the sound-board command byte the main CPU sends BEFORE any decoding or
+// mixing happens (wmssnd.c's dcs_data_w -> sndbrd.c's snd_cmd_log -> this message) -- a discrete
+// "play sound #N" event, not audio. Forwarded the same way every other raw event is (broadcast-
+// only via /api/emit, never logAction'd -- a busy table could send one of these on nearly every
+// hit, same volume reasoning as switches/solenoids).
+//
+// WHAT THIS DOES NOT DO: say what command N MEANS. There is no lookup here (or anywhere yet)
+// from a command byte to "this is the jackpot callout" vs "this is background music track 3" --
+// that mapping is per-ROM and undiscovered, the same kind of gap the solenoid ids had before
+// PinMAME's own driver source resolved them. This just makes the raw signal visible; reading
+// it is future work, same sequencing as every other "map it, then use it" step in this project.
+static void OnAudioCmd(const unsigned int eventId, void* userData, void* msgData)
+{
+   if (!msgData || !sender)
+      return;
+   const PinMAMEChildBoardEventMsg& msg = *static_cast<PinMAMEChildBoardEventMsg*>(msgData);
+   sender->PostEvent('A', (int)msg.boardNo, (int)msg.cmd);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 //
 // Live score forwarding via PinMAME's own NVRAM, using the community
@@ -1959,6 +1985,13 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginLoad(const uint32_t sessionId, con
    msgApi->SubscribeMsg(endpointId, onAudioBusLevelId, OnAudioBusLevel, nullptr);
    audioMeter->RefreshNames(); // sources may already exist if we loaded late
 
+   // Raw sound-board command bytes -- see OnAudioCmd's own comment for what this is and isn't.
+   // PMPI_NAMESPACE (PinMAME's own message namespace), not CTLPI_NAMESPACE -- this is PinMAME
+   // exposing its internal CPU<->soundboard traffic, not the generic controller audio API the
+   // handlers just above use.
+   onAudioCmdId = msgApi->GetMsgID(PMPI_NAMESPACE, PMPI_EVT_ON_AUDIO_CMD);
+   msgApi->SubscribeMsg(endpointId, onAudioCmdId, OnAudioCmd, nullptr);
+
    // Inbound: dashboard fader -> running table's mixer. Started after the ids above exist,
    // because ApplyPending needs getAudioSrcId to resolve names to sources.
    gainPoller = std::make_unique<GainPoller>();
@@ -1982,6 +2015,10 @@ MSGPI_EXPORT void MSGPIAPI CabinetBridgePluginUnload()
       msgApi->ReleaseMsgID(onAudioUpdateId);
       msgApi->ReleaseMsgID(onAudioSrcChangedId);
       msgApi->ReleaseMsgID(getAudioSrcId);
+   }
+   if (msgApi && onAudioCmdId) {
+      msgApi->UnsubscribeMsg(onAudioCmdId, OnAudioCmd, nullptr);
+      msgApi->ReleaseMsgID(onAudioCmdId);
    }
    // Stop submitting runnables, THEN flush the ones already queued -- MsgPlugin.h requires that
    // order on unload, or a marshalled ApplyPending could run after its plugin state is gone.
